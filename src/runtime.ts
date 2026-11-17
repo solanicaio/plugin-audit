@@ -1,0 +1,27 @@
+// Shared runtime wiring for the plugin-audit frontend.
+//
+// The host injects React and an authenticated fetch via the `register(api)`
+// call, so no module imports React directly. `initRuntime` is called once from
+// register(); every other module reads these live bindings.
+import type { PluginApi } from '@openeverest/plugin-sdk';
+
+export let React: PluginApi['React'];
+export let pluginFetch: PluginApi['fetch'];
+// Proxy base the plugin is served under
+// (`/v1/clusters/{cluster}/plugins/{pluginName}`). Used to build asset URLs
+// that must be plain strings (e.g. <img src>) and so can't go through fetch.
+export let pluginBasePath: PluginApi['basePath'];
+// Forwarded to PluginThemeProvider so Emotion's <style> tags pass the host CSP.
+export let cssNonce: PluginApi['cssNonce'];
+
+export function initRuntime(api: PluginApi): void {
+  React = api.React;
+  pluginFetch = api.fetch.bind(api);
+  pluginBasePath = api.basePath;
+  cssNonce = api.cssNonce;
+}
+
+// h is a thin React.createElement wrapper so components can be authored
+// without JSX (the host owns the React version).
+export const h = (type: any, props: any, ...children: any[]): any =>
+  React.createElement(type, props, ...children);
