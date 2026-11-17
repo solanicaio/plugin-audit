@@ -90,7 +90,7 @@ export function EventsChart(props: {
           hideLegend: true,
           onAxisClick: (_: unknown, d: { dataIndex: number } | null) => {
             const b = d ? buckets[d.dataIndex] : undefined;
-            if (!b) return;
+            if (!b || b.normal + b.warning === 0) return;
             const since = new Date(b.start);
             onZoom(since.toISOString(), new Date(since.getTime() + step * 1000 - 1).toISOString());
           },
