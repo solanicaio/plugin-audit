@@ -17,6 +17,8 @@ Built for compliance and operational forensics: who did what, when, to which res
 
 The MVP is **deployable end-to-end**: a Helm chart installs the Plugin CR, the backend daemon consumes SSE events from the host and stores them in SQLite, and the React extension renders the audit log at `/audit` in the OpenEverest UI.
 
+The audit log page shows the number of events over time, stacked by severity, above the event list. The time range is a preset (15 minutes to 30 days, or all) or a custom range; clicking a bar zooms into it. Events can be filtered by engine, kind, event reason, namespace, actor, severity, a database or object name, and free text. Each filter shows how many events have each value. The filters are kept in the page URL, so a view can be shared, and the matching events can be exported as CSV or JSON. The engine and the instance of backups and restores need an OpenEverest version whose events report them.
+
 ---
 
 ## Architecture
@@ -111,11 +113,15 @@ All paths below are reached as `/api/...` from the host (the host strips that pr
 
 | Method | Path | Description |
 | --- | --- | --- |
-| POST | `/api/events/query` | List events, newest first. Body: `kinds`, `reasons`, `namespaces`, `actors`, `search`, `since`, `until` (RFC 3339), `limit` (≤500), `before` (the `next` token of the previous page). |
+| POST | `/api/events/query` | List events, newest first. Body: the filter (below), `limit` (≤500) and `before` (the `next` token of the previous page). |
 | POST | `/api/events/get` | Single event with its full envelope. Body: `{"id": 1}`. |
-| POST | `/api/facets` | Distinct kinds, reasons, namespaces and actors seen. |
+| POST | `/api/facets` | Values of kinds, reasons, namespaces, actors and providers, with event counts. Body: the filter; each facet ignores its own selection. |
 | POST | `/api/stats` | Counts by dimension for a filter, plus the last event time. |
+| POST | `/api/histogram` | Events over time, by severity. Body: the filter. The bucket size (`step`, seconds) is picked for at most 120 buckets. |
+| POST | `/api/export` | Download the matching events (newest 10,000) as CSV or JSON. Body: the filter and `format` (`csv` or `json`). |
 | GET | `/healthz` | Liveness/readiness. |
+
+The filter is a JSON object with the optional fields `providers`, `kinds`, `reasons`, `namespaces`, `actors` (lists), `severities` (`Normal`, `Warning`), `name` (object or instance name contains), `search` (any text), and `since` / `until` (RFC 3339).
 
 ---
 
@@ -139,7 +145,7 @@ Point the running server at a real Everest API with `EVEREST_API_URL` and provid
 ## Roadmap
 
 - **Phase 2** — pluggable storage with PostgreSQL backend, retention policy, schema migration tool.
-- **Phase 3** — MUI-themed UI, structured logs, Prometheus metrics, saved filter views, CSV/NDJSON export.
+- **Phase 3** — structured logs, Prometheus metrics, saved filter views.
 - **Phase 4** — outbound delivery (webhook, Slack, S3) and alerting rules.
 
 ---

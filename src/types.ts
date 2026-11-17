@@ -14,6 +14,8 @@ export type AuditEvent = {
   actorType?: string;
   actorID?: string;
   message?: string;
+  instance?: string;
+  provider?: string;
   // The LifecycleEvent as returned by the OpenEverest events API.
   envelope: LifecycleEvent;
 };
@@ -29,11 +31,22 @@ export type ListResponse = {
   next?: string;
 };
 
+export type FacetValue = { value: string; count: number };
+
 export type Facets = {
-  kinds: string[];
-  reasons: string[];
-  namespaces: string[];
-  actors: string[];
+  kinds: FacetValue[];
+  reasons: FacetValue[];
+  namespaces: FacetValue[];
+  actors: FacetValue[];
+  providers: FacetValue[];
+};
+
+export const emptyFacets: Facets = {
+  kinds: [],
+  reasons: [],
+  namespaces: [],
+  actors: [],
+  providers: [],
 };
 
 export type Stats = {
@@ -41,22 +54,41 @@ export type Stats = {
   lastEventAt?: string;
 };
 
+export type Bucket = { start: string; normal: number; warning: number };
+
+export type Histogram = {
+  // Bucket size in seconds, 0 when no event matches.
+  step: number;
+  buckets: Bucket[];
+};
+
+export type Severity = 'Normal' | 'Warning';
+
+export type ListKey = 'providers' | 'kinds' | 'reasons' | 'namespaces' | 'actors';
+
 export type FilterState = {
-  kinds: string[];
-  reasons: string[];
-  namespaces: string[];
-  actors: string[];
+  [K in ListKey]: string[];
+} & {
+  severities: Severity[];
+  // Matches the object or instance names that contain it.
+  name: string;
   search: string;
-  since: string; // datetime-local value
+  // A preset of TIME_RANGES, or 'custom' for since and until.
+  range: string;
+  since: string; // ISO time, for a custom range
   until: string;
 };
 
 export const emptyFilter: FilterState = {
+  providers: [],
   kinds: [],
   reasons: [],
   namespaces: [],
   actors: [],
+  severities: [],
+  name: '',
   search: '',
+  range: '24h',
   since: '',
   until: '',
 };

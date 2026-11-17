@@ -1,6 +1,7 @@
 import { defineConfig } from 'vite';
 import type { Plugin } from 'vite';
 import react from '@vitejs/plugin-react-swc';
+import { fileURLToPath } from 'node:url';
 
 // Resolved at runtime by the host import map, so the plugin shares the host React singleton.
 // Everything else (MUI, Emotion) is bundled so the plugin keeps its own pinned copy.
@@ -21,8 +22,23 @@ const failOnHostRequire = (): Plugin => ({
   },
 });
 
+const shim = (file: string) => fileURLToPath(new URL(`./src/shims/${file}`, import.meta.url));
+
 export default defineConfig(({ command }) => ({
   plugins: [react(), failOnHostRequire()],
+  resolve: {
+    // @mui/x-charts depends on CommonJS use-sync-external-store, see src/shims.
+    alias: [
+      {
+        find: /^use-sync-external-store\/shim\/with-selector(\.js)?$/,
+        replacement: shim('use-sync-external-store-with-selector.ts'),
+      },
+      {
+        find: /^use-sync-external-store\/shim(\/index\.js)?$/,
+        replacement: shim('use-sync-external-store.ts'),
+      },
+    ],
+  },
   // Library mode leaves process.env untouched, but bundled MUI/Emotion read NODE_ENV.
   define:
     command === 'build'

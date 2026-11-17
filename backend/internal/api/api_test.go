@@ -30,7 +30,7 @@ func TestAuditDataIsOnlyServedOnPOST(t *testing.T) {
 	mux := http.NewServeMux()
 	Register(mux, st, embed.FS{}, nil)
 
-	for _, path := range []string{"/api/events", "/api/events/query", "/api/events/get", "/api/facets", "/api/stats"} {
+	for _, path := range []string{"/api/events", "/api/events/query", "/api/events/get", "/api/facets", "/api/stats", "/api/histogram", "/api/export"} {
 		rec := httptest.NewRecorder()
 		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
 		if rec.Code < 400 || strings.Contains(rec.Body.String(), "e1") {

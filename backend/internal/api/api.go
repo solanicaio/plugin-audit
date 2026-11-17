@@ -41,15 +41,19 @@ func Register(mux *http.ServeMux, st store.Store, distFS embed.FS, icon []byte) 
 	// The audit data is served on POST only. The host proxies plugin GETs
 	// without authentication, for the bundle and the icon, but requires a
 	// signed-in user allowed to use the plugin for the other methods.
-	h := &handlers{st: st}
+	h := &handlers{st: st, now: time.Now}
 	mux.HandleFunc("POST /api/events/query", h.query)
 	mux.HandleFunc("POST /api/events/get", h.get)
 	mux.HandleFunc("POST /api/facets", h.facets)
 	mux.HandleFunc("POST /api/stats", h.stats)
+	mux.HandleFunc("POST /api/histogram", h.histogram)
+	mux.HandleFunc("POST /api/export", h.export)
 }
 
 type handlers struct {
 	st store.Store
+	// now is time.Now, replaced in tests.
+	now func() time.Time
 }
 
 // maxBodyBytes bounds the size of a request body.
@@ -66,7 +70,12 @@ type filterRequest struct {
 	Reasons    []string `json:"reasons"`
 	Namespaces []string `json:"namespaces"`
 	Actors     []string `json:"actors"`
-	Search     string   `json:"search"`
+	Providers  []string `json:"providers"`
+	// Severities is Normal, Warning or both.
+	Severities []string `json:"severities"`
+	// Name matches the object or instance names that contain it.
+	Name   string `json:"name"`
+	Search string `json:"search"`
 	// Since and Until are RFC 3339 timestamps.
 	Since *time.Time `json:"since"`
 	Until *time.Time `json:"until"`
@@ -117,7 +126,11 @@ func (h *handlers) get(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handlers) facets(w http.ResponseWriter, r *http.Request) {
-	f, err := h.st.Facets(r.Context())
+	q, ok := readFilter(w, r)
+	if !ok {
+		return
+	}
+	f, err := h.st.Facets(r.Context(), q)
 	if err != nil {
 		log.Printf("facets: %v", err)
 		writeError(w, http.StatusInternalServerError, "lookup failed")
@@ -156,6 +169,10 @@ func readFilter(w http.ResponseWriter, r *http.Request) (store.Filter, bool) {
 	if !readJSON(w, r, &req) {
 		return store.Filter{}, false
 	}
+	return toFilter(w, req)
+}
+
+func toFilter(w http.ResponseWriter, req filterRequest) (store.Filter, bool) {
 	switch {
 	case req.Limit == 0:
 		req.Limit = defaultLimit
@@ -171,11 +188,24 @@ func readFilter(w http.ResponseWriter, r *http.Request) (store.Filter, bool) {
 			return store.Filter{}, false
 		}
 	}
+	if req.Since != nil && req.Until != nil && req.Until.Before(*req.Since) {
+		writeError(w, http.StatusBadRequest, "until is before since")
+		return store.Filter{}, false
+	}
+	for _, s := range req.Severities {
+		if s != "Normal" && s != "Warning" {
+			writeError(w, http.StatusBadRequest, "severities must be Normal or Warning")
+			return store.Filter{}, false
+		}
+	}
 	return store.Filter{
 		Kinds:      clean(req.Kinds),
 		Reasons:    clean(req.Reasons),
 		Namespaces: clean(req.Namespaces),
 		Actors:     clean(req.Actors),
+		Providers:  clean(req.Providers),
+		Severities: req.Severities,
+		Name:       strings.TrimSpace(req.Name),
 		Search:     strings.TrimSpace(req.Search),
 		Since:      req.Since,
 		Until:      req.Until,

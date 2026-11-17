@@ -35,7 +35,10 @@ export const sx = {
     borderRadius: 1,
     mb: 2,
   },
-  filter: { flex: '1 1 200px', minWidth: 180 },
+  filter: { flex: '1 1 180px', minWidth: 160 },
+  count: { color: 'text.secondary', fontSize: '0.75rem', ml: 2, fontVariantNumeric: 'tabular-nums' },
+  chart: { p: 2, pb: 1, mb: 2 },
+  controls: { display: 'flex', gap: 1.5, alignItems: 'center', flexWrap: 'wrap', mb: 2 },
   empty: { p: 6, textAlign: 'center', color: 'text.secondary' },
   nowrap: { whiteSpace: 'nowrap' },
   message: {

@@ -1,7 +1,7 @@
 import { h } from '../runtime';
 import { formatTime, reasonColor, sx } from '../styles';
 import { DrawerShell } from './DrawerShell';
-import { Box, Chip, Divider, IconButton, Typography } from '@mui/material';
+import { Box, Button, Chip, Divider, IconButton, Typography } from '@mui/material';
 import type { AuditEvent } from '../types';
 
 function detail(label: string, value?: string): any {
@@ -17,8 +17,13 @@ function detail(label: string, value?: string): any {
 const sectionTitle = (label: string): any =>
   h(Typography, { variant: 'overline', component: 'div', sx: sx.sectionTitle }, label);
 
-export function EventDrawer(props: { event: AuditEvent; onClose: () => void }): any {
-  const { event, onClose } = props;
+export function EventDrawer(props: {
+  event: AuditEvent;
+  onClose: () => void;
+  // Filters the log by an instance name.
+  onShowInstance: (name: string) => void;
+}): any {
+  const { event, onClose, onShowInstance } = props;
   const env = event.envelope ?? {};
   const phase = env.phase && (env.phase.from || env.phase.to)
     ? `${env.phase.from || '—'} → ${env.phase.to || '—'}`
@@ -72,6 +77,8 @@ export function EventDrawer(props: { event: AuditEvent; onClose: () => void }): 
       detail('Type', event.type),
       detail('Severity', event.severity),
       detail('Object', object),
+      detail('Instance', event.instance),
+      detail('Engine', event.provider),
       detail('Phase', phase),
       detail('Actor', actor),
       detail('Source IP', typeof env.sourceIP === 'string' ? env.sourceIP : undefined),
@@ -79,6 +86,13 @@ export function EventDrawer(props: { event: AuditEvent; onClose: () => void }): 
       detail('Event', event.name),
       detail('Cursor', event.cursor)
     ),
+    event.instance
+      ? h(
+          Button,
+          { size: 'small', sx: { mt: 1 }, onClick: () => onShowInstance(event.instance!) },
+          `Show events of ${event.instance}`
+        )
+      : null,
     h(Divider, { sx: { my: 2 } }),
     sectionTitle('Raw event'),
     h(Box, { component: 'pre', sx: sx.codeBlock }, JSON.stringify(event.envelope, null, 2))

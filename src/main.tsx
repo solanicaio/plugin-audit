@@ -26,14 +26,19 @@ import {
   TableRow,
   Typography,
 } from '@mui/material';
-import { fetchEvents, fetchFacets, fetchStats } from './data';
+import { exportEvents, fetchEvents, fetchFacets, fetchHistogram, fetchStats, toQuery } from './data';
+import { hasFilters, readURL, writeURL } from './filters';
 import { Toolbar } from './components/Toolbar';
+import { TimeRange } from './components/TimeRange';
+import { EventsChart } from './components/EventsChart';
+import { FilterChips } from './components/FilterChips';
+import { ExportButton } from './components/ExportButton';
 import { EventRow } from './components/EventRow';
 import { EventDrawer } from './components/EventDrawer';
-import { emptyFilter } from './types';
-import type { AuditEvent, Facets, FilterState, Stats } from './types';
+import { emptyFacets, emptyFilter } from './types';
+import type { AuditEvent, Facets, FilterState, Histogram, Severity, Stats } from './types';
 
-const SEARCH_DEBOUNCE_MS = 300;
+const TYPING_DEBOUNCE_MS = 300;
 
 function useDebounced<T>(value: T, delay: number): T {
   const [debounced, setDebounced] = React.useState(value);
@@ -45,52 +50,55 @@ function useDebounced<T>(value: T, delay: number): T {
 }
 
 const AuditPage = (): any => {
-  const [filter, setFilter] = React.useState<FilterState>(emptyFilter);
-  const search = useDebounced(filter.search, SEARCH_DEBOUNCE_MS);
-  const query = React.useMemo(() => ({ ...filter, search }), [
-    filter.kinds,
-    filter.reasons,
-    filter.namespaces,
-    filter.actors,
-    filter.since,
-    filter.until,
-    search,
-  ]);
-  const [facets, setFacets] = React.useState<Facets>({
-    kinds: [],
-    reasons: [],
-    namespaces: [],
-    actors: [],
-  });
+  const [filter, setFilter] = React.useState<FilterState>(() => readURL(window.location.search));
+  // Typing in the text fields doesn't query on every key.
+  const name = useDebounced(filter.name, TYPING_DEBOUNCE_MS);
+  const search = useDebounced(filter.search, TYPING_DEBOUNCE_MS);
+  const committed = { ...filter, name, search };
+  const key = JSON.stringify(committed);
+  const [reloads, setReloads] = React.useState(0);
+  // Relative ranges are resolved when the filter changes or on refresh.
+  const query = React.useMemo(() => toQuery(committed, Date.now()), [key, reloads]);
+
+  const [facets, setFacets] = React.useState<Facets>(emptyFacets);
   const [events, setEvents] = React.useState<AuditEvent[]>([]);
   const [stats, setStats] = React.useState<Stats | null>(null);
+  const [histogram, setHistogram] = React.useState<Histogram | null>(null);
   const [next, setNext] = React.useState<string | null>(null);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
   const [selected, setSelected] = React.useState<AuditEvent | null>(null);
-  const [reloads, setReloads] = React.useState(0);
 
+  // The filter is kept in the page URL, so the view can be shared.
   React.useEffect(() => {
-    fetchFacets().then(setFacets).catch(() => {});
-  }, [reloads]);
+    const { pathname, search: current, hash } = window.location;
+    const updated = writeURL(committed, current);
+    if (updated !== current) {
+      window.history.replaceState(window.history.state, '', pathname + updated + hash);
+    }
+  }, [key]);
 
   React.useEffect(() => {
     let cancelled = false;
     setLoading(true);
     setError(null);
-    Promise.all([fetchEvents(query), fetchStats(query)])
-      .then(([list, s]) => {
+    fetchFacets(query)
+      .then((f) => !cancelled && setFacets(f))
+      .catch(() => {});
+    Promise.all([fetchEvents(query), fetchStats(query), fetchHistogram(query)])
+      .then(([list, s, hist]) => {
         if (cancelled) return;
         setEvents(list.items ?? []);
         setNext(list.next ?? null);
         setStats(s);
+        setHistogram(hist);
       })
       .catch((err: Error) => !cancelled && setError(err.message))
       .finally(() => !cancelled && setLoading(false));
     return () => {
       cancelled = true;
     };
-  }, [query, reloads]);
+  }, [query]);
 
   const loadMore = () => {
     if (next == null) return;
@@ -104,10 +112,17 @@ const AuditPage = (): any => {
       .finally(() => setLoading(false));
   };
 
-  const filtered = JSON.stringify(query) !== JSON.stringify(emptyFilter);
-  const summary = stats
-    ? `${stats.total} ${filtered ? 'matching' : 'recorded'} event${stats.total === 1 ? '' : 's'}`
-    : 'Loading…';
+  const toggleSeverity = (s: Severity) =>
+    setFilter((f) => ({ ...f, severities: f.severities.includes(s) ? [] : [s] }));
+  const zoom = (since: string, until: string) => setFilter((f) => ({ ...f, range: 'custom', since, until }));
+  const clearFilters = () => setFilter((f) => ({ ...emptyFilter, range: f.range, since: f.since, until: f.until }));
+  const doExport = (format: 'csv' | 'json') =>
+    exportEvents(query, format).catch((err: Error) => setError(`Export failed: ${err.message}`));
+
+  const filtered = hasFilters(committed);
+  const total = stats?.total ?? 0;
+  const noun = `${filtered ? 'matching ' : ''}event${total === 1 ? '' : 's'}`;
+  const summary = stats ? `${total.toLocaleString()} ${noun} in this time range` : 'Loading…';
 
   return h(
     PluginThemeProvider,
@@ -129,20 +144,26 @@ const AuditPage = (): any => {
           )
         ),
         h(
-          Button,
-          { variant: 'outlined', size: 'small', onClick: () => setReloads((n) => n + 1) },
-          'Refresh'
+          Box,
+          { sx: { display: 'flex', gap: 1 } },
+          h(ExportButton, { total, onExport: doExport }),
+          h(Button, { variant: 'outlined', size: 'small', onClick: () => setReloads((n) => n + 1) }, 'Refresh')
         )
       ),
 
-      error ? h(Alert, { severity: 'error', sx: { mb: 2 } }, `Failed to load events: ${error}`) : null,
+      error ? h(Alert, { severity: 'error', sx: { mb: 2 } }, error) : null,
 
-      h(Toolbar, {
-        filter,
-        facets,
-        onChange: setFilter,
-        onReset: () => setFilter(emptyFilter),
+      h(Box, { sx: sx.controls }, h(TimeRange, { filter, onChange: setFilter })),
+
+      h(EventsChart, {
+        histogram,
+        severities: filter.severities,
+        onToggleSeverity: toggleSeverity,
+        onZoom: zoom,
       }),
+
+      h(Toolbar, { filter, facets, onChange: setFilter }),
+      h(FilterChips, { filter, onChange: setFilter, onClear: clearFilters }),
 
       loading && events.length === 0
         ? h(Box, { sx: sx.empty }, 'Loading events…')
@@ -150,8 +171,8 @@ const AuditPage = (): any => {
         ? h(
             Box,
             { sx: sx.empty },
-            filtered
-              ? 'No events match the current filters.'
+            filtered || filter.range !== 'all'
+              ? 'No events match the current filters and time range.'
               : 'No events yet. Lifecycle events appear here as they are recorded.'
           )
         : h(
@@ -190,7 +211,16 @@ const AuditPage = (): any => {
           )
         : null,
 
-      selected ? h(EventDrawer, { event: selected, onClose: () => setSelected(null) }) : null
+      selected
+        ? h(EventDrawer, {
+            event: selected,
+            onClose: () => setSelected(null),
+            onShowInstance: (instance: string) => {
+              setSelected(null);
+              setFilter((f) => ({ ...f, name: instance }));
+            },
+          })
+        : null
     )
   );
 };

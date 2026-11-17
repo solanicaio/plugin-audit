@@ -13,6 +13,7 @@
     "@emotion/react": "^11.11.0",
     "@emotion/styled": "^11.11.0",
     "@mui/material": "^7.3.0",
+    "@mui/x-charts": "^9.18.1",
     "@openeverest/plugin-theme": "^0.1.0"
   },
   "devDependencies": {
