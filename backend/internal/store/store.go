@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -50,7 +51,44 @@ type Filter struct {
 	Since      *time.Time
 	Until      *time.Time
 	Limit      int
-	BeforeID   int64 // cursor — return events with id < BeforeID
+	// Before returns the events older than a page token from a previous
+	// Query, see PageToken.
+	Before *Page
+}
+
+// Page is the position of an event in the newest-first order of a Query.
+type Page struct {
+	OccurredAt time.Time
+	ID         int64
+}
+
+// PageToken returns the token of the page after e.
+func PageToken(e Event) string {
+	return formatTime(e.OccurredAt) + "_" + strconv.FormatInt(e.ID, 10)
+}
+
+// ParsePageToken parses a token returned by PageToken.
+func ParsePageToken(token string) (*Page, error) {
+	at, id, ok := strings.Cut(token, "_")
+	if !ok {
+		return nil, errors.New("invalid page token")
+	}
+	t, err := time.Parse(time.RFC3339Nano, at)
+	if err != nil {
+		return nil, errors.New("invalid page token")
+	}
+	n, err := strconv.ParseInt(id, 10, 64)
+	if err != nil || n <= 0 {
+		return nil, errors.New("invalid page token")
+	}
+	return &Page{OccurredAt: t, ID: n}, nil
+}
+
+// timeLayout stores times with a fixed width, so they sort as text.
+const timeLayout = "2006-01-02T15:04:05.000Z07:00"
+
+func formatTime(t time.Time) string {
+	return t.UTC().Format(timeLayout)
 }
 
 // Facets are the distinct values stored for the filterable columns.
@@ -173,7 +211,13 @@ func (s *sqliteStore) migrate() error {
 			return fmt.Errorf("add column %s: %w", col, err)
 		}
 	}
-	_, err = s.db.Exec(eventIndexes)
+	if _, err := s.db.Exec(eventIndexes); err != nil {
+		return err
+	}
+	// Earlier versions stored RFC 3339 times with a variable number of
+	// fractional digits, which don't sort as text.
+	_, err = s.db.Exec(`UPDATE events SET occurred_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', occurred_at), occurred_at)
+		WHERE occurred_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'`)
 	return err
 }
 
@@ -183,7 +227,7 @@ func (s *sqliteStore) Insert(ctx context.Context, e *Event) error {
 		  (resource_version, type, occurred_at, namespace, resource_kind, resource_name, actor_type, actor_id, envelope,
 		   event_name, cluster, reason, severity, message)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		e.Cursor, e.Type, e.OccurredAt.UTC().Format(time.RFC3339Nano),
+		e.Cursor, e.Type, formatTime(e.OccurredAt),
 		nullable(e.Namespace), nullable(e.ResourceKind), nullable(e.ResourceName),
 		nullable(e.ActorType), nullable(e.ActorID), string(e.Envelope),
 		nullable(e.Name), nullable(e.Cluster), nullable(e.Reason), nullable(e.Severity), nullable(e.Message),
@@ -202,7 +246,7 @@ func (s *sqliteStore) Get(ctx context.Context, id int64) (*Event, error) {
 
 func (s *sqliteStore) Query(ctx context.Context, f Filter) ([]Event, error) {
 	q, args := buildWhere(baseSelect, f)
-	q += ` ORDER BY id DESC LIMIT ?`
+	q += ` ORDER BY occurred_at DESC, id DESC LIMIT ?`
 	limit := f.Limit
 	if limit <= 0 || limit > 500 {
 		limit = 100
@@ -423,15 +467,16 @@ func buildWhere(base string, f Filter) (string, []any) {
 	}
 	if f.Since != nil {
 		conds = append(conds, "occurred_at >= ?")
-		args = append(args, f.Since.UTC().Format(time.RFC3339Nano))
+		args = append(args, formatTime(*f.Since))
 	}
 	if f.Until != nil {
 		conds = append(conds, "occurred_at <= ?")
-		args = append(args, f.Until.UTC().Format(time.RFC3339Nano))
+		args = append(args, formatTime(*f.Until))
 	}
-	if f.BeforeID > 0 {
-		conds = append(conds, "id < ?")
-		args = append(args, f.BeforeID)
+	if f.Before != nil {
+		at := formatTime(f.Before.OccurredAt)
+		conds = append(conds, "(occurred_at < ? OR (occurred_at = ? AND id < ?))")
+		args = append(args, at, at, f.Before.ID)
 	}
 	q := base
 	if len(conds) > 0 {

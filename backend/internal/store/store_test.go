@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -136,5 +137,83 @@ INSERT INTO meta (key, value) VALUES ('cursor', '42');`)
 	}
 	if len(got) != 2 || got[0].Reason != "Created" || got[1].ResourceName != "old" {
 		t.Fatalf("got %+v, want the new and the old event", got)
+	}
+	// The old time format is rewritten, so time filters compare correctly.
+	since := time.Date(2025, 12, 31, 23, 59, 59, 500e6, time.UTC)
+	got, err = st.Query(ctx, Filter{Since: &since, Until: &since, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("got %+v, want no event", got)
+	}
+	until := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	got, err = st.Query(ctx, Filter{Until: &until, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ResourceName != "old" {
+		t.Fatalf("got %+v, want the old event", got)
+	}
+}
+
+// TestQueryOrdersByTimeAndPages checks that events inserted out of order,
+// as a relist does, are returned newest first, and that paging doesn't
+// skip events that share a timestamp.
+func TestQueryOrdersByTimeAndPages(t *testing.T) {
+	ctx := context.Background()
+	st, err := OpenSQLite(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	base := time.Date(2026, 11, 18, 10, 0, 0, 0, time.UTC)
+	for _, in := range []struct {
+		name string
+		at   time.Duration
+	}{
+		{"t3", 3 * time.Second},
+		// 1.5s and 2s compare in the wrong order as RFC 3339 text.
+		{"t1.5", 1500 * time.Millisecond},
+		{"t2a", 2 * time.Second},
+		{"t2b", 2 * time.Second},
+		{"t1", time.Second},
+	} {
+		e := newEvent(in.name, in.name, "Instance", "Created")
+		e.OccurredAt = base.Add(in.at)
+		if err := st.Insert(ctx, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var names []string
+	f := Filter{Limit: 2}
+	for page := 0; page < 5; page++ {
+		got, err := st.Query(ctx, f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range got {
+			names = append(names, e.Name)
+		}
+		if len(got) < f.Limit {
+			break
+		}
+		if f.Before, err = ParsePageToken(PageToken(got[len(got)-1])); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := []string{"t3", "t2b", "t2a", "t1.5", "t1"}
+	if strings.Join(names, ",") != strings.Join(want, ",") {
+		t.Fatalf("got %v, want %v", names, want)
+	}
+
+	since := base.Add(1800 * time.Millisecond)
+	got, err := st.Query(ctx, Filter{Since: &since, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("got %d events since 1.8s, want 3", len(got))
 	}
 }

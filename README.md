@@ -107,15 +107,14 @@ Environment variables (also configurable directly on the Deployment):
 
 ## REST API (host-proxied)
 
-All paths below are reached as `/api/...` from the host (the host strips that prefix when forwarding):
+All paths below are reached as `/api/...` from the host (the host strips that prefix when forwarding). Audit data is served on POST only, because the host proxies plugin GETs without authentication:
 
 | Method | Path | Description |
 | --- | --- | --- |
-| GET | `/api/events` | List events. Query: `types`, `namespaces`, `actors`, `search`, `since`, `until`, `limit` (≤500), `beforeID` (cursor). |
-| GET | `/api/events/{id}` | Single event with full envelope. |
-| GET | `/api/events/types` | Distinct event types seen. |
-| GET | `/api/events/namespaces` | Distinct namespaces seen. |
-| GET | `/api/stats` | Aggregate counts by type / namespace / actor + last seen. |
+| POST | `/api/events/query` | List events, newest first. Body: `kinds`, `reasons`, `namespaces`, `actors`, `search`, `since`, `until` (RFC 3339), `limit` (≤500), `before` (the `next` token of the previous page). |
+| POST | `/api/events/get` | Single event with its full envelope. Body: `{"id": 1}`. |
+| POST | `/api/facets` | Distinct kinds, reasons, namespaces and actors seen. |
+| POST | `/api/stats` | Counts by dimension for a filter, plus the last event time. |
 | GET | `/healthz` | Liveness/readiness. |
 
 ---

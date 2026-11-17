@@ -68,10 +68,11 @@ type filterRequest struct {
 	Actors     []string `json:"actors"`
 	Search     string   `json:"search"`
 	// Since and Until are RFC 3339 timestamps.
-	Since    *time.Time `json:"since"`
-	Until    *time.Time `json:"until"`
-	Limit    int        `json:"limit"`
-	BeforeID int64      `json:"beforeID"`
+	Since *time.Time `json:"since"`
+	Until *time.Time `json:"until"`
+	Limit int        `json:"limit"`
+	// Before is the next token of a previous query.
+	Before string `json:"before"`
 }
 
 func (h *handlers) query(w http.ResponseWriter, r *http.Request) {
@@ -90,7 +91,7 @@ func (h *handlers) query(w http.ResponseWriter, r *http.Request) {
 	}
 	resp := map[string]any{"items": events}
 	if n := len(events); n == f.Limit {
-		resp["nextBeforeID"] = events[n-1].ID
+		resp["next"] = store.PageToken(events[n-1])
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -162,9 +163,13 @@ func readFilter(w http.ResponseWriter, r *http.Request) (store.Filter, bool) {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("limit must be 1..%d", maxLimit))
 		return store.Filter{}, false
 	}
-	if req.BeforeID < 0 {
-		writeError(w, http.StatusBadRequest, "invalid beforeID")
-		return store.Filter{}, false
+	var before *store.Page
+	if req.Before != "" {
+		var err error
+		if before, err = store.ParsePageToken(req.Before); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return store.Filter{}, false
+		}
 	}
 	return store.Filter{
 		Kinds:      clean(req.Kinds),
@@ -175,7 +180,7 @@ func readFilter(w http.ResponseWriter, r *http.Request) (store.Filter, bool) {
 		Since:      req.Since,
 		Until:      req.Until,
 		Limit:      req.Limit,
-		BeforeID:   req.BeforeID,
+		Before:     before,
 	}, true
 }
 

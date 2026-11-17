@@ -34,7 +34,7 @@ type AuditEvent = {
 
 type ListResponse = {
   items: AuditEvent[] | null;
-  nextBeforeID?: number;
+  next?: string;
 };
 
 // ---------------------------------------------------------------------------
@@ -80,7 +80,7 @@ function buildQuery(f: FilterState) {
     since: f.since ? new Date(f.since).toISOString() : undefined,
     until: f.until ? new Date(f.until).toISOString() : undefined,
     limit: f.limit,
-    beforeID: f.beforeID ?? undefined,
+    before: f.before ?? undefined,
   };
 }
 
@@ -101,7 +101,7 @@ type FilterState = {
   since: string; // datetime-local string
   until: string;
   limit: number;
-  beforeID: number | null;
+  before: string | null;
 };
 
 const emptyFilter: FilterState = {
@@ -112,7 +112,7 @@ const emptyFilter: FilterState = {
   since: '',
   until: '',
   limit: 100,
-  beforeID: null,
+  before: null,
 };
 
 // ---------------------------------------------------------------------------
@@ -238,7 +238,7 @@ const AuditPage = (_props: PluginRouteProps) => {
   const [filter, setFilter] = React.useState<FilterState>(emptyFilter);
   const [draft, setDraft] = React.useState<FilterState>(emptyFilter);
   const [events, setEvents] = React.useState<AuditEvent[]>([]);
-  const [nextBeforeID, setNextBeforeID] = React.useState<number | null>(null);
+  const [next, setNext] = React.useState<string | null>(null);
   const [facets, setFacets] = React.useState<Facets>({ kinds: [], reasons: [], namespaces: [] });
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
@@ -260,7 +260,7 @@ const AuditPage = (_props: PluginRouteProps) => {
       .then((r) => {
         if (cancelled) return;
         setEvents(r.items ?? []);
-        setNextBeforeID(r.nextBeforeID ?? null);
+        setNext(r.next ?? null);
       })
       .catch((err: Error) => !cancelled && setError(err.message))
       .finally(() => !cancelled && setLoading(false));
@@ -269,18 +269,18 @@ const AuditPage = (_props: PluginRouteProps) => {
     };
   }, [filter]);
 
-  const apply = () => setFilter({ ...draft, beforeID: null });
+  const apply = () => setFilter({ ...draft, before: null });
   const reset = () => {
     setDraft(emptyFilter);
     setFilter(emptyFilter);
   };
   const loadMore = () => {
-    if (nextBeforeID == null) return;
+    if (next == null) return;
     setLoading(true);
-    api<ListResponse>('/events/query', buildQuery({ ...filter, beforeID: nextBeforeID }))
+    api<ListResponse>('/events/query', buildQuery({ ...filter, before: next }))
       .then((r) => {
         setEvents((prev) => [...prev, ...(r.items ?? [])]);
-        setNextBeforeID(r.nextBeforeID ?? null);
+        setNext(r.next ?? null);
       })
       .catch((err: Error) => setError(err.message))
       .finally(() => setLoading(false));
@@ -431,7 +431,7 @@ const AuditPage = (_props: PluginRouteProps) => {
         )
       ),
 
-    nextBeforeID != null &&
+    next != null &&
       React.createElement(
         'div',
         { style: { marginTop: '1rem', textAlign: 'center' as const } },
