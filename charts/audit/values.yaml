@@ -83,6 +83,7 @@ storage:
 
 # Optional override for the Everest API URL. When left empty the backend
 # auto-discovers the everest Service via Kubernetes-injected env vars.
+# Falls back to http://everest.everest-system.svc.cluster.local:8080.
 everestAPIURL: ""
 
 resources:

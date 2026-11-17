@@ -13,7 +13,7 @@ type Config struct {
 	Port string
 
 	// EverestAPIURL is the base URL of the OpenEverest API (e.g.
-	// http://everest-server.everest-system.svc.cluster.local:8080).
+	// http://everest.everest-system.svc.cluster.local:8080).
 	EverestAPIURL string
 
 	// ServiceUser and ServicePassword are the credentials of the OpenEverest
@@ -58,7 +58,7 @@ func discoverEverestAPI() string {
 	if host != "" && port != "" {
 		return fmt.Sprintf("http://%s:%s", host, port)
 	}
-	return "http://everest-server.everest-system.svc.cluster.local:8080"
+	return "http://everest.everest-system.svc.cluster.local:8080"
 }
 
 func getenv(key, def string) string {
