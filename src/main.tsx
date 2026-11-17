@@ -16,8 +16,13 @@ let pluginFetch: PluginApi['fetch'];
 // ---------------------------------------------------------------------------
 type AuditEvent = {
   id: number;
-  resourceVersion: string;
+  name?: string;
+  cursor: string;
   type: string;
+  reason?: string;
+  severity?: string;
+  cluster?: string;
+  message?: string;
   occurredAt: string;
   namespace?: string;
   resourceKind?: string;
@@ -35,12 +40,19 @@ type ListResponse = {
 // ---------------------------------------------------------------------------
 // API client
 // ---------------------------------------------------------------------------
-async function authedFetch(path: string): Promise<Response> {
+// The audit data is served on POST only: the host proxies plugin GETs without
+// authentication.
+async function authedFetch(path: string, body: unknown): Promise<Response> {
   const send = () => {
-    const headers: Record<string, string> = {};
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     const token = getAuthToken();
     if (token) headers.Authorization = `Bearer ${token}`;
-    return pluginFetch(path, { credentials: 'include', headers });
+    return pluginFetch(path, {
+      method: 'POST',
+      credentials: 'include',
+      headers,
+      body: JSON.stringify(body ?? {}),
+    });
   };
   let res = await send();
   if (res.status === 401) {
@@ -50,8 +62,8 @@ async function authedFetch(path: string): Promise<Response> {
   return res;
 }
 
-async function api<T>(path: string): Promise<T> {
-  const res = await authedFetch(`/api${path}`);
+async function api<T>(path: string, body?: unknown): Promise<T> {
+  const res = await authedFetch(`/api${path}`, body);
   if (!res.ok) {
     const text = await res.text().catch(() => '');
     throw new Error(text || `HTTP ${res.status}`);
@@ -59,24 +71,31 @@ async function api<T>(path: string): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-function buildQuery(f: FilterState): string {
-  const p = new URLSearchParams();
-  if (f.types.length) p.set('types', f.types.join(','));
-  if (f.namespaces.length) p.set('namespaces', f.namespaces.join(','));
-  if (f.search.trim()) p.set('search', f.search.trim());
-  if (f.since) p.set('since', new Date(f.since).toISOString());
-  if (f.until) p.set('until', new Date(f.until).toISOString());
-  p.set('limit', String(f.limit));
-  if (f.beforeID) p.set('beforeID', String(f.beforeID));
-  const s = p.toString();
-  return s ? `?${s}` : '';
+function buildQuery(f: FilterState) {
+  return {
+    kinds: f.kinds,
+    reasons: f.reasons,
+    namespaces: f.namespaces,
+    search: f.search.trim() || undefined,
+    since: f.since ? new Date(f.since).toISOString() : undefined,
+    until: f.until ? new Date(f.until).toISOString() : undefined,
+    limit: f.limit,
+    beforeID: f.beforeID ?? undefined,
+  };
 }
+
+type Facets = {
+  kinds: string[];
+  reasons: string[];
+  namespaces: string[];
+};
 
 // ---------------------------------------------------------------------------
 // Filter state
 // ---------------------------------------------------------------------------
 type FilterState = {
-  types: string[];
+  kinds: string[];
+  reasons: string[];
   namespaces: string[];
   search: string;
   since: string; // datetime-local string
@@ -86,7 +105,8 @@ type FilterState = {
 };
 
 const emptyFilter: FilterState = {
-  types: [],
+  kinds: [],
+  reasons: [],
   namespaces: [],
   search: '',
   since: '',
@@ -219,19 +239,15 @@ const AuditPage = (_props: PluginRouteProps) => {
   const [draft, setDraft] = React.useState<FilterState>(emptyFilter);
   const [events, setEvents] = React.useState<AuditEvent[]>([]);
   const [nextBeforeID, setNextBeforeID] = React.useState<number | null>(null);
-  const [types, setTypes] = React.useState<string[]>([]);
-  const [namespaces, setNamespaces] = React.useState<string[]>([]);
+  const [facets, setFacets] = React.useState<Facets>({ kinds: [], reasons: [], namespaces: [] });
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const [selected, setSelected] = React.useState<AuditEvent | null>(null);
 
   // Initial load of distinct values for filter dropdowns.
   React.useEffect(() => {
-    api<{ items: string[] | null }>('/events/types')
-      .then((r) => setTypes(r.items ?? []))
-      .catch(() => {});
-    api<{ items: string[] | null }>('/events/namespaces')
-      .then((r) => setNamespaces(r.items ?? []))
+    api<Facets>('/facets')
+      .then(setFacets)
       .catch(() => {});
   }, []);
 
@@ -240,7 +256,7 @@ const AuditPage = (_props: PluginRouteProps) => {
     let cancelled = false;
     setLoading(true);
     setError(null);
-    api<ListResponse>('/events' + buildQuery(filter))
+    api<ListResponse>('/events/query', buildQuery(filter))
       .then((r) => {
         if (cancelled) return;
         setEvents(r.items ?? []);
@@ -261,7 +277,7 @@ const AuditPage = (_props: PluginRouteProps) => {
   const loadMore = () => {
     if (nextBeforeID == null) return;
     setLoading(true);
-    api<ListResponse>('/events' + buildQuery({ ...filter, beforeID: nextBeforeID }))
+    api<ListResponse>('/events/query', buildQuery({ ...filter, beforeID: nextBeforeID }))
       .then((r) => {
         setEvents((prev) => [...prev, ...(r.items ?? [])]);
         setNextBeforeID(r.nextBeforeID ?? null);
@@ -282,12 +298,23 @@ const AuditPage = (_props: PluginRouteProps) => {
       React.createElement(
         'div',
         { style: styles.field },
-        React.createElement('label', { style: styles.label }, 'Event types'),
+        React.createElement('label', { style: styles.label }, 'Kinds'),
         React.createElement(MultiSelect, {
-          options: types,
-          value: draft.types,
-          onChange: (v: string[]) => setDraft({ ...draft, types: v }),
-          placeholder: 'All types',
+          options: facets.kinds,
+          value: draft.kinds,
+          onChange: (v: string[]) => setDraft({ ...draft, kinds: v }),
+          placeholder: 'All kinds',
+        })
+      ),
+      React.createElement(
+        'div',
+        { style: styles.field },
+        React.createElement('label', { style: styles.label }, 'Reasons'),
+        React.createElement(MultiSelect, {
+          options: facets.reasons,
+          value: draft.reasons,
+          onChange: (v: string[]) => setDraft({ ...draft, reasons: v }),
+          placeholder: 'All reasons',
         })
       ),
       React.createElement(
@@ -295,7 +322,7 @@ const AuditPage = (_props: PluginRouteProps) => {
         { style: styles.field },
         React.createElement('label', { style: styles.label }, 'Namespaces'),
         React.createElement(MultiSelect, {
-          options: namespaces,
+          options: facets.namespaces,
           value: draft.namespaces,
           onChange: (v: string[]) => setDraft({ ...draft, namespaces: v }),
           placeholder: 'All namespaces',
@@ -308,7 +335,7 @@ const AuditPage = (_props: PluginRouteProps) => {
         React.createElement('input', {
           style: styles.input,
           type: 'text',
-          placeholder: 'name or payload…',
+          placeholder: 'name, message or payload…',
           value: draft.search,
           onChange: (e: any) => setDraft({ ...draft, search: e.target.value }),
           onKeyDown: (e: any) => e.key === 'Enter' && apply(),
@@ -347,7 +374,7 @@ const AuditPage = (_props: PluginRouteProps) => {
       ? React.createElement(
           'div',
           { style: styles.banner('info') },
-          'No events yet. Once the plugin daemon connects to /v1/events, captured events will appear here.'
+          'No events yet. Captured lifecycle events will appear here.'
         )
       : null,
 
@@ -436,7 +463,10 @@ const EventDrawer = (props: { event: AuditEvent; onClose: () => void }) => {
       labelValue('Namespace', event.namespace),
       labelValue('Resource', event.resourceKind ? `${event.resourceKind}/${event.resourceName ?? ''}` : undefined),
       labelValue('Actor', event.actorID ? `${event.actorType ?? ''}:${event.actorID}` : undefined),
-      labelValue('Resource version', event.resourceVersion)
+      labelValue('Reason', event.reason),
+      labelValue('Severity', event.severity),
+      labelValue('Message', event.message),
+      labelValue('Cursor', event.cursor)
     ),
     React.createElement('h3', null, 'Envelope'),
     React.createElement('pre', { style: styles.pre }, JSON.stringify(event.envelope, null, 2))

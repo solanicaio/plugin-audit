@@ -4,9 +4,11 @@ package api
 import (
 	"embed"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -36,22 +38,45 @@ func Register(mux *http.ServeMux, st store.Store, distFS embed.FS, icon []byte) 
 		_, _ = w.Write(icon)
 	})
 
+	// The audit data is served on POST only. The host proxies plugin GETs
+	// without authentication, for the bundle and the icon, but requires a
+	// signed-in user allowed to use the plugin for the other methods.
 	h := &handlers{st: st}
-	mux.HandleFunc("GET /api/events", h.list)
-	mux.HandleFunc("GET /api/events/{id}", h.get)
-	mux.HandleFunc("GET /api/events/types", h.types)
-	mux.HandleFunc("GET /api/events/namespaces", h.namespaces)
-	mux.HandleFunc("GET /api/stats", h.stats)
+	mux.HandleFunc("POST /api/events/query", h.query)
+	mux.HandleFunc("POST /api/events/get", h.get)
+	mux.HandleFunc("POST /api/facets", h.facets)
+	mux.HandleFunc("POST /api/stats", h.stats)
 }
 
 type handlers struct {
 	st store.Store
 }
 
-func (h *handlers) list(w http.ResponseWriter, r *http.Request) {
-	f, err := parseFilter(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+// maxBodyBytes bounds the size of a request body.
+const maxBodyBytes = 64 << 10
+
+const (
+	defaultLimit = 100
+	maxLimit     = 500
+)
+
+// filterRequest is the body of the query and stats requests.
+type filterRequest struct {
+	Kinds      []string `json:"kinds"`
+	Reasons    []string `json:"reasons"`
+	Namespaces []string `json:"namespaces"`
+	Actors     []string `json:"actors"`
+	Search     string   `json:"search"`
+	// Since and Until are RFC 3339 timestamps.
+	Since    *time.Time `json:"since"`
+	Until    *time.Time `json:"until"`
+	Limit    int        `json:"limit"`
+	BeforeID int64      `json:"beforeID"`
+}
+
+func (h *handlers) query(w http.ResponseWriter, r *http.Request) {
+	f, ok := readFilter(w, r)
+	if !ok {
 		return
 	}
 	events, err := h.st.Query(r.Context(), f)
@@ -60,9 +85,10 @@ func (h *handlers) list(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "query failed")
 		return
 	}
-	resp := map[string]any{
-		"items": events,
+	if events == nil {
+		events = []store.Event{}
 	}
+	resp := map[string]any{"items": events}
 	if n := len(events); n == f.Limit {
 		resp["nextBeforeID"] = events[n-1].ID
 	}
@@ -70,13 +96,15 @@ func (h *handlers) list(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handlers) get(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid id")
+	var req struct {
+		ID int64 `json:"id"`
+	}
+	if !readJSON(w, r, &req) {
 		return
 	}
-	e, err := h.st.Get(r.Context(), id)
+	e, err := h.st.Get(r.Context(), req.ID)
 	if err != nil {
+		log.Printf("get event %d: %v", req.ID, err)
 		writeError(w, http.StatusInternalServerError, "lookup failed")
 		return
 	}
@@ -87,92 +115,75 @@ func (h *handlers) get(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, e)
 }
 
-func (h *handlers) types(w http.ResponseWriter, r *http.Request) {
-	vals, err := h.st.Types(r.Context())
+func (h *handlers) facets(w http.ResponseWriter, r *http.Request) {
+	f, err := h.st.Facets(r.Context())
 	if err != nil {
+		log.Printf("facets: %v", err)
 		writeError(w, http.StatusInternalServerError, "lookup failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": vals})
-}
-
-func (h *handlers) namespaces(w http.ResponseWriter, r *http.Request) {
-	vals, err := h.st.Namespaces(r.Context())
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "lookup failed")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": vals})
+	writeJSON(w, http.StatusOK, f)
 }
 
 func (h *handlers) stats(w http.ResponseWriter, r *http.Request) {
-	f, err := parseFilter(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	f, ok := readFilter(w, r)
+	if !ok {
 		return
 	}
 	s, err := h.st.Stats(r.Context(), f)
 	if err != nil {
+		log.Printf("stats: %v", err)
 		writeError(w, http.StatusInternalServerError, "stats failed")
 		return
 	}
 	writeJSON(w, http.StatusOK, s)
 }
 
-func parseFilter(r *http.Request) (store.Filter, error) {
-	q := r.URL.Query()
-	f := store.Filter{
-		Types:      csv(q.Get("types")),
-		Namespaces: csv(q.Get("namespaces")),
-		Actors:     csv(q.Get("actors")),
-		Search:     strings.TrimSpace(q.Get("search")),
+// readJSON decodes the request body into v. An empty body leaves v unchanged.
+func readJSON(w http.ResponseWriter, r *http.Request, v any) bool {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return false
 	}
-	if v := q.Get("limit"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 1 || n > 500 {
-			return f, errBadParam("limit must be 1..500")
-		}
-		f.Limit = n
-	} else {
-		f.Limit = 100
-	}
-	if v := q.Get("beforeID"); v != "" {
-		n, err := strconv.ParseInt(v, 10, 64)
-		if err != nil || n < 0 {
-			return f, errBadParam("invalid beforeID")
-		}
-		f.BeforeID = n
-	}
-	if v := q.Get("since"); v != "" {
-		t, err := time.Parse(time.RFC3339, v)
-		if err != nil {
-			return f, errBadParam("since must be RFC3339")
-		}
-		f.Since = &t
-	}
-	if v := q.Get("until"); v != "" {
-		t, err := time.Parse(time.RFC3339, v)
-		if err != nil {
-			return f, errBadParam("until must be RFC3339")
-		}
-		f.Until = &t
-	}
-	return f, nil
+	return true
 }
 
-type errBadParam string
-
-func (e errBadParam) Error() string { return string(e) }
-
-func csv(s string) []string {
-	if s == "" {
-		return nil
+func readFilter(w http.ResponseWriter, r *http.Request) (store.Filter, bool) {
+	var req filterRequest
+	if !readJSON(w, r, &req) {
+		return store.Filter{}, false
 	}
-	parts := strings.Split(s, ",")
-	out := parts[:0]
-	for _, p := range parts {
-		if p = strings.TrimSpace(p); p != "" {
-			out = append(out, p)
+	switch {
+	case req.Limit == 0:
+		req.Limit = defaultLimit
+	case req.Limit < 0 || req.Limit > maxLimit:
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("limit must be 1..%d", maxLimit))
+		return store.Filter{}, false
+	}
+	if req.BeforeID < 0 {
+		writeError(w, http.StatusBadRequest, "invalid beforeID")
+		return store.Filter{}, false
+	}
+	return store.Filter{
+		Kinds:      clean(req.Kinds),
+		Reasons:    clean(req.Reasons),
+		Namespaces: clean(req.Namespaces),
+		Actors:     clean(req.Actors),
+		Search:     strings.TrimSpace(req.Search),
+		Since:      req.Since,
+		Until:      req.Until,
+		Limit:      req.Limit,
+		BeforeID:   req.BeforeID,
+	}, true
+}
+
+func clean(vals []string) []string {
+	var out []string
+	for _, v := range vals {
+		if v = strings.TrimSpace(v); v != "" {
+			out = append(out, v)
 		}
 	}
 	return out

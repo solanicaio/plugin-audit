@@ -18,11 +18,9 @@ spec:
     extensionPoints:
       {{- toYaml .Values.plugin.extensionPoints | nindent 6 }}
   permissions:
+    {{- range list "instances" "backups" "restores" "backup-imports" "backup-storages" "monitoring-destinations" "plugins" "installed-extensions" "namespaces" }}
+    - verb: read-events
+      resource: {{ . }}
+    {{- end }}
     - verb: read
-      resource: database-clusters
-    - verb: read
-      resource: backups
-    - verb: read
-      resource: restores
-    - verb: read
-      resource: instances
+      resource: platform-events

@@ -35,8 +35,14 @@ spec:
               value: {{ .Values.service.port | quote }}
             - name: AUDIT_DB_PATH
               value: {{ .Values.storage.sqlite.path | quote }}
-            {{- with .Values.plugin.eventTypes }}
-            - name: AUDIT_EVENT_TYPES
+            - name: AUDIT_CLUSTER
+              value: {{ .Values.plugin.cluster | quote }}
+            {{- with .Values.plugin.kinds }}
+            - name: AUDIT_KINDS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- with .Values.plugin.reasons }}
+            - name: AUDIT_REASONS
               value: {{ join "," . | quote }}
             {{- end }}
             {{- with .Values.plugin.namespaces }}
