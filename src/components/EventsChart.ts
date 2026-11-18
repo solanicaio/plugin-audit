@@ -1,6 +1,6 @@
 import { h, React } from '../runtime';
 import { sx } from '../styles';
-import { BarChart } from '@mui/x-charts/BarChart';
+import { LineChart } from '@mui/x-charts/LineChart';
 import { Box, Chip, Paper, Typography, useTheme } from '@mui/material';
 import type { Histogram, Severity } from '../types';
 
@@ -38,8 +38,8 @@ export function EventsChart(props: {
   // About eight labels, whatever the number of bars.
   const every = Math.max(1, Math.ceil(buckets.length / 8));
   const colors: Record<Severity, string> = {
-    Normal: theme.palette.primary.main,
-    Warning: theme.palette.warning.main,
+    Normal: theme.palette.mode === 'dark' ? '#6F8FF7' : '#4F6FD8',
+    Warning: theme.palette.mode === 'dark' ? '#FF9A8B' : '#D96C5F',
   };
 
   const legend = (['Normal', 'Warning'] as const).map((s) =>
@@ -65,7 +65,7 @@ export function EventsChart(props: {
     ),
     buckets.length === 0
       ? h(Box, { sx: { ...sx.empty, p: 4 } }, 'No events in this time range.')
-      : h(BarChart, {
+      : h(LineChart, {
           height: 180,
           dataset,
           margin: { top: 12, right: 8, bottom: 4, left: 4 },
@@ -73,7 +73,8 @@ export function EventsChart(props: {
             {
               scaleType: 'band',
               dataKey: 't',
-              categoryGapRatio: 0.15,
+              disableTicks: true,
+              disableLine: true,
               tickLabelInterval: (_: Date, i: number) => i % every === 0,
               valueFormatter: (d: Date, ctx: { location: string }) =>
                 ctx.location === 'tick'
@@ -83,8 +84,22 @@ export function EventsChart(props: {
           ],
           yAxis: [{ tickMinStep: 1, width: 36 }],
           series: [
-            { dataKey: 'normal', label: 'Normal', stack: 'severity', color: colors.Normal },
-            { dataKey: 'warning', label: 'Warning', stack: 'severity', color: colors.Warning },
+            {
+              dataKey: 'normal',
+              label: 'Normal',
+              stack: 'severity',
+              area: true,
+              curve: 'monotoneX',
+              color: colors.Normal,
+            },
+            {
+              dataKey: 'warning',
+              label: 'Warning',
+              stack: 'severity',
+              area: true,
+              curve: 'monotoneX',
+              color: colors.Warning,
+            },
           ],
           grid: { horizontal: true },
           hideLegend: true,
