@@ -27,6 +27,7 @@ service:
 #   p, role:auditor, instances, read-events, */*/*
 #   p, role:auditor, backups, read-events, */*/*
 #   p, role:auditor, restores, read-events, */*/*
+#   p, role:auditor, providers, read-events, */*
 #   p, role:auditor, backup-imports, read-events, */*/*
 #   p, role:auditor, backup-storages, read-events, */*/*
 #   p, role:auditor, monitoring-destinations, read-events, */*/*

@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -75,12 +77,129 @@ func TestQueryFiltersAndFacets(t *testing.T) {
 	if len(got) != 1 || got[0].Name != "c" {
 		t.Fatalf("got %+v, want only event c", got)
 	}
-	f, err := st.Facets(ctx)
+	// A facet is counted without its own selection, so the other kinds stay
+	// selectable, and with the selection of the other facets.
+	f, err := st.Facets(ctx, Filter{Kinds: []string{"Instance"}, Reasons: []string{"Created"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(f.Kinds) != 2 || len(f.Reasons) != 2 || len(f.Namespaces) != 1 || len(f.Actors) != 0 {
-		t.Fatalf("unexpected facets %+v", f)
+	want := Facets{
+		Kinds:      []FacetValue{{"Backup", 1}, {"Instance", 1}},
+		Reasons:    []FacetValue{{"Created", 1}, {"Deleted", 1}},
+		Namespaces: []FacetValue{{"dbs", 1}},
+		Actors:     []FacetValue{},
+		Providers:  []FacetValue{},
+	}
+	if !reflect.DeepEqual(*f, want) {
+		t.Fatalf("got facets %+v, want %+v", *f, want)
+	}
+}
+
+func TestQueryByInstanceProviderAndSeverity(t *testing.T) {
+	ctx := context.Background()
+	st, err := OpenSQLite(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	for _, in := range []struct {
+		name, kind, object, instance, provider, severity string
+	}{
+		{"a", "Instance", "orders-db", "orders-db", "percona-server-mysql", "Normal"},
+		{"b", "Backup", "nightly-1", "orders-db", "percona-server-mysql", "Warning"},
+		{"c", "Instance", "users_db", "users_db", "percona-postgresql", "Normal"},
+		{"d", "User", "admin", "", "", ""},
+	} {
+		e := newEvent(in.name, in.name, in.kind, "Created")
+		e.ResourceName, e.Instance, e.Provider, e.Severity = in.object, in.instance, in.provider, in.severity
+		if err := st.Insert(ctx, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct {
+		name string
+		f    Filter
+		want string
+	}{
+		{"provider", Filter{Providers: []string{"percona-server-mysql"}}, "b,a"},
+		{"name matches the instance of a backup", Filter{Name: "orders"}, "b,a"},
+		{"name matches the object", Filter{Name: "nightly"}, "b"},
+		{"name is not a pattern", Filter{Name: "%"}, ""},
+		{"name with an underscore", Filter{Name: "s_db"}, "c"},
+		{"warnings", Filter{Severities: []string{"Warning"}}, "b"},
+		{"no severity is normal", Filter{Severities: []string{"Normal"}, Kinds: []string{"User"}}, "d"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.f.Limit = 10
+			got, err := st.Query(ctx, tc.f)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var names []string
+			for _, e := range got {
+				names = append(names, e.Name)
+			}
+			if strings.Join(names, ",") != tc.want {
+				t.Fatalf("got %v, want %s", names, tc.want)
+			}
+		})
+	}
+	f, err := st.Facets(ctx, Filter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []FacetValue{{"percona-server-mysql", 2}, {"percona-postgresql", 1}}; !reflect.DeepEqual(f.Providers, want) {
+		t.Fatalf("got providers %+v, want %+v", f.Providers, want)
+	}
+}
+
+func TestHistogram(t *testing.T) {
+	ctx := context.Background()
+	st, err := OpenSQLite(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	start := time.Date(2026, 11, 18, 10, 0, 0, 0, time.UTC)
+	for i, in := range []struct {
+		at       time.Duration
+		severity string
+	}{
+		{0, "Normal"},
+		{4*time.Minute + 59*time.Second, "Warning"},
+		{5 * time.Minute, ""},
+		{17 * time.Minute, "Warning"},
+		// Before the range.
+		{-time.Second, "Normal"},
+	} {
+		e := newEvent(strconv.Itoa(i), strconv.Itoa(i), "Instance", "Created")
+		e.OccurredAt, e.Severity = start.Add(in.at), in.severity
+		if err := st.Insert(ctx, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := st.Histogram(ctx, Filter{}, start, 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Bucket{
+		{start, 1, 1},
+		{start.Add(5 * time.Minute), 1, 0},
+		{start.Add(15 * time.Minute), 0, 1},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+
+	oldest, newest, ok, err := st.Span(ctx, Filter{Severities: []string{"Warning"}})
+	if err != nil || !ok {
+		t.Fatalf("span: %v, %v", ok, err)
+	}
+	if !oldest.Equal(start.Add(4*time.Minute+59*time.Second)) || !newest.Equal(start.Add(17*time.Minute)) {
+		t.Fatalf("got span %s..%s", oldest, newest)
+	}
+	if _, _, ok, err := st.Span(ctx, Filter{Kinds: []string{"Nope"}}); ok || err != nil {
+		t.Fatalf("span of no events: %v, %v", ok, err)
 	}
 }
 
@@ -215,5 +334,38 @@ func TestQueryOrdersByTimeAndPages(t *testing.T) {
 	}
 	if len(got) != 3 {
 		t.Fatalf("got %d events since 1.8s, want 3", len(got))
+	}
+}
+
+// TestBackfillsInstances checks that Instance events stored before the
+// instance column get their own name as instance.
+func TestBackfillsInstances(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "audit.db")
+	st, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range []*Event{
+		newEvent("a", "1", "Instance", "Created"),
+		newEvent("b", "2", "Backup", "Created"),
+	} {
+		if err := st.Insert(ctx, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st.Close()
+
+	st, err = OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	got, err := st.Query(ctx, Filter{Name: "db1", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[1].Instance != "db1" || got[0].Instance != "" {
+		t.Fatalf("got %+v, want db1 as the instance of the Instance event only", got)
 	}
 }

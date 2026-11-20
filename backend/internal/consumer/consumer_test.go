@@ -221,3 +221,30 @@ func TestTokenSourceRefreshesAndFallsBack(t *testing.T) {
 		t.Errorf("grants %s, want password,refresh_token,refresh_token,password", got)
 	}
 }
+
+func TestRecordsInstanceAndProvider(t *testing.T) {
+	c, st := newTestConsumer(t, &fakeAPI{t: t})
+	ctx := context.Background()
+	backup := `{"name":"b1","cursor":"1","occurredAt":"2026-11-18T10:00:00Z","type":"backup.created","reason":"Created",` +
+		`"severity":"Normal","cluster":"main","namespace":"dbs","object":{"kind":"Backup","name":"nightly"},` +
+		`"instance":"db1","provider":"percona-server-mysql"}`
+	// Core versions before the events API reported the instance.
+	instance := lifecycleEventJSON("i1", "2")
+	for _, raw := range []string{backup, instance} {
+		if err := c.record(ctx, json.RawMessage(raw)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	events, err := st.Query(ctx, store.Filter{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string][2]string{}
+	for _, e := range events {
+		got[e.Name] = [2]string{e.Instance, e.Provider}
+	}
+	want := map[string][2]string{"b1": {"db1", "percona-server-mysql"}, "i1": {"db1", ""}}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}

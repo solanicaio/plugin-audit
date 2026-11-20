@@ -350,7 +350,9 @@ type lifecycleEvent struct {
 		Type string `json:"type"`
 		ID   string `json:"id"`
 	} `json:"actor"`
-	Message string `json:"message"`
+	Message  string `json:"message"`
+	Instance string `json:"instance"`
+	Provider string `json:"provider"`
 }
 
 func (c *Consumer) record(ctx context.Context, raw json.RawMessage) error {
@@ -381,7 +383,13 @@ func (c *Consumer) record(ctx context.Context, raw json.RawMessage) error {
 		ActorType:    ev.Actor.Type,
 		ActorID:      ev.Actor.ID,
 		Message:      ev.Message,
+		Instance:     ev.Instance,
+		Provider:     ev.Provider,
 		Envelope:     raw,
+	}
+	// Core versions before the events API reported the instance.
+	if e.Instance == "" && e.ResourceKind == "Instance" {
+		e.Instance = e.ResourceName
 	}
 	if err := c.store.Insert(ctx, e); err != nil {
 		return fmt.Errorf("store event %s: %w", ev.Name, err)
