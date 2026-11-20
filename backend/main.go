@@ -2,15 +2,15 @@
 //
 // Operates in three modes simultaneously (see spec 003 §6.2 / §10):
 //
-//  1. Event consumer — holds an open SSE connection to GET /v1/events and
-//     persists every event into local SQLite (configurable storage in later
-//     phases).
-//  2. Request handler — serves /api/events, /api/events/{id},
-//     /api/events/types, /api/stats so the UI can browse the audit log.
+//  1. Event consumer — lists and then watches the lifecycle events of a
+//     cluster (GET /v1/clusters/{cluster}/events) and persists them into
+//     local SQLite.
+//  2. Request handler — serves POST /api/events/query, /api/events/get,
+//     /api/facets and /api/stats so the UI can browse the audit log.
 //  3. Bundle host — serves /main.js and /icon.png for the frontend.
 //
-// The daemon authenticates to the OpenEverest API with the plugin service
-// token mounted at /var/run/secrets/everest/token (see spec 003 §10.4).
+// The daemon logs in to the OpenEverest API as EVEREST_SERVICE_USER with
+// POST /v1/auth/token.
 package main
 
 import (

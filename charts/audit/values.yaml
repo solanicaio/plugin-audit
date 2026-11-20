@@ -13,10 +13,28 @@ fullnameOverride: ""
 service:
   port: 8080
 
-# Authentication for the event stream connection.
-# Until the host implements spec 003 §10.4 (projected plugin service tokens),
-# the plugin authenticates via POST /v1/session using credentials from a Secret.
-# Create a Secret with keys "username" and "password", then reference its name here.
+# Credentials of the OpenEverest user the daemon reads the events as. The host
+# doesn't issue plugin service tokens yet (spec 003 §10.4), so the daemon logs
+# in with POST /v1/auth/token: once with the password, then with the refresh
+# token. Create a Secret with keys "username" and "password", then reference its
+# name here.
+#
+# The events API only returns the events the user may read: read-events on the
+# objects they are about, and read on platform-events for logins and logouts.
+# The admin role covers both. A dedicated read-only role, in the everest-rbac
+# ConfigMap:
+#
+#   p, role:auditor, instances, read-events, */*/*
+#   p, role:auditor, backups, read-events, */*/*
+#   p, role:auditor, restores, read-events, */*/*
+#   p, role:auditor, backup-imports, read-events, */*/*
+#   p, role:auditor, backup-storages, read-events, */*/*
+#   p, role:auditor, monitoring-destinations, read-events, */*/*
+#   p, role:auditor, installed-extensions, read-events, */*
+#   p, role:auditor, plugins, read-events, */*
+#   p, role:auditor, namespaces, read-events, */*
+#   p, role:auditor, platform-events, read, *
+#   g, <username>, role:auditor
 auth:
   credentialsSecretName: ""
 
@@ -35,35 +53,19 @@ plugin:
       label: Audit Log
       icon: "/icon.png"
 
-  # Event types the daemon subscribes to (spec 003 §10.5).
-  # Empty list = all event types.
-  eventTypes:
-    - database-cluster.created
-    - database-cluster.ready
-    - database-cluster.updated
-    - database-cluster.deleted
-    - database-cluster.failed
-    - backup.started
-    - backup.completed
-    - backup.failed
-    - restore.started
-    - restore.completed
-    - restore.failed
-    - instance.created
-    - instance.deleted
-    - user.login
-    - user.login-failed
-    - user.logout
-    - plugin.installed
-    - plugin.uninstalled
-    - plugin.enabled
-    - plugin.disabled
-    - namespace.added
-    - namespace.removed
-    - settings.updated
+  # OpenEverest cluster whose lifecycle events are recorded.
+  cluster: main
 
-  # Optional namespace filter for the event subscription. Leave empty to
-  # consume from every namespace the plugin's permissions allow.
+  # Optional filters for the events API (GET /v1/clusters/{cluster}/events).
+  # Empty lists record everything.
+  # kinds: object kinds, e.g. Instance, Backup, Restore, User.
+  kinds: []
+  # reasons: Created, Updated, PhaseChanged, DeletionRequested, Deleted,
+  # LoginSucceeded, LoginFailed, Logout.
+  reasons: []
+
+  # Optional namespace filter. Leave empty to record the events of every
+  # namespace the user may read.
   namespaces: []
 
 # Storage configuration. MVP only supports the embedded SQLite driver; Phase 2
@@ -81,6 +83,7 @@ storage:
 
 # Optional override for the Everest API URL. When left empty the backend
 # auto-discovers the everest Service via Kubernetes-injected env vars.
+# Falls back to http://everest.everest-system.svc.cluster.local:8080.
 everestAPIURL: ""
 
 resources:

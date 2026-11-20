@@ -10,44 +10,100 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
 
-// Event is the persisted form of an audit event. It mirrors the plugin-facing
-// envelope defined in spec 003 §10.5 with a couple of indexed columns lifted
-// out for fast filtering.
+// Event is the persisted form of a lifecycle event (GET
+// /v1/clusters/{cluster}/events), with the fields used for filtering lifted
+// out of the verbatim JSON in Envelope.
 type Event struct {
-	ID              int64           `json:"id"`
-	ResourceVersion string          `json:"resourceVersion"`
-	Type            string          `json:"type"`
-	OccurredAt      time.Time       `json:"occurredAt"`
-	Namespace       string          `json:"namespace,omitempty"`
-	ResourceKind    string          `json:"resourceKind,omitempty"`
-	ResourceName    string          `json:"resourceName,omitempty"`
-	ActorType       string          `json:"actorType,omitempty"`
-	ActorID         string          `json:"actorID,omitempty"`
-	Envelope        json.RawMessage `json:"envelope"`
+	ID int64 `json:"id"`
+	// Name is the name of the Kubernetes Event. With Cluster and Namespace it
+	// identifies the event. Empty for events recorded before the events API
+	// moved to Kubernetes Events.
+	Name         string          `json:"name,omitempty"`
+	Cursor       string          `json:"cursor"`
+	Type         string          `json:"type"`
+	Reason       string          `json:"reason,omitempty"`
+	Severity     string          `json:"severity,omitempty"`
+	OccurredAt   time.Time       `json:"occurredAt"`
+	Cluster      string          `json:"cluster,omitempty"`
+	Namespace    string          `json:"namespace,omitempty"`
+	ResourceKind string          `json:"resourceKind,omitempty"`
+	ResourceName string          `json:"resourceName,omitempty"`
+	ActorType    string          `json:"actorType,omitempty"`
+	ActorID      string          `json:"actorID,omitempty"`
+	Message      string          `json:"message,omitempty"`
+	Envelope     json.RawMessage `json:"envelope"`
 }
 
 // Filter narrows a Query. Empty fields are ignored.
 type Filter struct {
-	Types      []string
+	Kinds      []string
+	Reasons    []string
 	Namespaces []string
 	Actors     []string
 	Search     string
 	Since      *time.Time
 	Until      *time.Time
 	Limit      int
-	BeforeID   int64 // cursor — return events with id < BeforeID
+	// Before returns the events older than a page token from a previous
+	// Query, see PageToken.
+	Before *Page
+}
+
+// Page is the position of an event in the newest-first order of a Query.
+type Page struct {
+	OccurredAt time.Time
+	ID         int64
+}
+
+// PageToken returns the token of the page after e.
+func PageToken(e Event) string {
+	return formatTime(e.OccurredAt) + "_" + strconv.FormatInt(e.ID, 10)
+}
+
+// ParsePageToken parses a token returned by PageToken.
+func ParsePageToken(token string) (*Page, error) {
+	at, id, ok := strings.Cut(token, "_")
+	if !ok {
+		return nil, errors.New("invalid page token")
+	}
+	t, err := time.Parse(time.RFC3339Nano, at)
+	if err != nil {
+		return nil, errors.New("invalid page token")
+	}
+	n, err := strconv.ParseInt(id, 10, 64)
+	if err != nil || n <= 0 {
+		return nil, errors.New("invalid page token")
+	}
+	return &Page{OccurredAt: t, ID: n}, nil
+}
+
+// timeLayout stores times with a fixed width, so they sort as text.
+const timeLayout = "2006-01-02T15:04:05.000Z07:00"
+
+func formatTime(t time.Time) string {
+	return t.UTC().Format(timeLayout)
+}
+
+// Facets are the distinct values stored for the filterable columns.
+type Facets struct {
+	Kinds      []string `json:"kinds"`
+	Reasons    []string `json:"reasons"`
+	Namespaces []string `json:"namespaces"`
+	Actors     []string `json:"actors"`
 }
 
 // Stats summarises a filtered slice of the audit log.
 type Stats struct {
 	Total       int64            `json:"total"`
-	ByType      map[string]int64 `json:"byType"`
+	ByKind      map[string]int64 `json:"byKind"`
+	ByReason    map[string]int64 `json:"byReason"`
 	ByNamespace map[string]int64 `json:"byNamespace"`
 	ByActor     map[string]int64 `json:"byActor"`
 	LastEventAt *time.Time       `json:"lastEventAt,omitempty"`
@@ -58,8 +114,7 @@ type Store interface {
 	Insert(ctx context.Context, e *Event) error
 	Get(ctx context.Context, id int64) (*Event, error)
 	Query(ctx context.Context, f Filter) ([]Event, error)
-	Types(ctx context.Context) ([]string, error)
-	Namespaces(ctx context.Context) ([]string, error)
+	Facets(ctx context.Context) (*Facets, error)
 	Stats(ctx context.Context, f Filter) (*Stats, error)
 	LatestCursor(ctx context.Context) (string, error)
 	SaveCursor(ctx context.Context, cursor string) error
@@ -114,19 +169,68 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 `
 
+// addedColumns were added when the events API moved to Kubernetes Events.
+// Rows stored before keep NULL in them.
+var addedColumns = []string{"event_name", "cluster", "reason", "severity", "message"}
+
+// A relist returns events already stored, possibly with a newer
+// resourceVersion, so events are identified by their Kubernetes name.
+const eventIndexes = `
+CREATE UNIQUE INDEX IF NOT EXISTS idx_events_identity
+  ON events(COALESCE(cluster, ''), COALESCE(namespace, ''), event_name) WHERE event_name IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_events_kind   ON events(resource_kind);
+CREATE INDEX IF NOT EXISTS idx_events_reason ON events(reason);
+`
+
 func (s *sqliteStore) migrate() error {
-	_, err := s.db.Exec(schema)
+	if _, err := s.db.Exec(schema); err != nil {
+		return err
+	}
+	existing := map[string]bool{}
+	rows, err := s.db.Query(`SELECT name FROM pragma_table_info('events')`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return err
+		}
+		existing[name] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, col := range addedColumns {
+		if existing[col] {
+			continue
+		}
+		if _, err := s.db.Exec(`ALTER TABLE events ADD COLUMN ` + col + ` TEXT`); err != nil {
+			return fmt.Errorf("add column %s: %w", col, err)
+		}
+	}
+	if _, err := s.db.Exec(eventIndexes); err != nil {
+		return err
+	}
+	// Earlier versions stored RFC 3339 times with a variable number of
+	// fractional digits, which don't sort as text.
+	_, err = s.db.Exec(`UPDATE events SET occurred_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', occurred_at), occurred_at)
+		WHERE occurred_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'`)
 	return err
 }
 
 func (s *sqliteStore) Insert(ctx context.Context, e *Event) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT OR IGNORE INTO events
-		  (resource_version, type, occurred_at, namespace, resource_kind, resource_name, actor_type, actor_id, envelope)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		e.ResourceVersion, e.Type, e.OccurredAt.UTC().Format(time.RFC3339Nano),
+		  (resource_version, type, occurred_at, namespace, resource_kind, resource_name, actor_type, actor_id, envelope,
+		   event_name, cluster, reason, severity, message)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		e.Cursor, e.Type, formatTime(e.OccurredAt),
 		nullable(e.Namespace), nullable(e.ResourceKind), nullable(e.ResourceName),
 		nullable(e.ActorType), nullable(e.ActorID), string(e.Envelope),
+		nullable(e.Name), nullable(e.Cluster), nullable(e.Reason), nullable(e.Severity), nullable(e.Message),
 	)
 	return err
 }
@@ -142,7 +246,7 @@ func (s *sqliteStore) Get(ctx context.Context, id int64) (*Event, error) {
 
 func (s *sqliteStore) Query(ctx context.Context, f Filter) ([]Event, error) {
 	q, args := buildWhere(baseSelect, f)
-	q += ` ORDER BY id DESC LIMIT ?`
+	q += ` ORDER BY occurred_at DESC, id DESC LIMIT ?`
 	limit := f.Limit
 	if limit <= 0 || limit > 500 {
 		limit = 100
@@ -164,21 +268,36 @@ func (s *sqliteStore) Query(ctx context.Context, f Filter) ([]Event, error) {
 	return out, rows.Err()
 }
 
-func (s *sqliteStore) Types(ctx context.Context) ([]string, error) {
-	return s.distinct(ctx, `SELECT DISTINCT type FROM events ORDER BY type`)
+func (s *sqliteStore) Facets(ctx context.Context) (*Facets, error) {
+	out := &Facets{}
+	for _, f := range []struct {
+		col string
+		dst *[]string
+	}{
+		{"resource_kind", &out.Kinds},
+		{"reason", &out.Reasons},
+		{"namespace", &out.Namespaces},
+		{"actor_id", &out.Actors},
+	} {
+		vals, err := s.distinct(ctx, f.col)
+		if err != nil {
+			return nil, err
+		}
+		*f.dst = vals
+	}
+	return out, nil
 }
 
-func (s *sqliteStore) Namespaces(ctx context.Context) ([]string, error) {
-	return s.distinct(ctx, `SELECT DISTINCT namespace FROM events WHERE namespace IS NOT NULL AND namespace <> '' ORDER BY namespace`)
-}
-
-func (s *sqliteStore) distinct(ctx context.Context, q string) ([]string, error) {
+// distinct returns the distinct non-empty values of col, which must be a
+// constant column name.
+func (s *sqliteStore) distinct(ctx context.Context, col string) ([]string, error) {
+	q := fmt.Sprintf(`SELECT DISTINCT %[1]s FROM events WHERE %[1]s IS NOT NULL AND %[1]s <> '' ORDER BY %[1]s`, col)
 	rows, err := s.db.QueryContext(ctx, q)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []string
+	out := []string{}
 	for rows.Next() {
 		var v sql.NullString
 		if err := rows.Scan(&v); err != nil {
@@ -193,7 +312,8 @@ func (s *sqliteStore) distinct(ctx context.Context, q string) ([]string, error) 
 
 func (s *sqliteStore) Stats(ctx context.Context, f Filter) (*Stats, error) {
 	out := &Stats{
-		ByType:      map[string]int64{},
+		ByKind:      map[string]int64{},
+		ByReason:    map[string]int64{},
 		ByNamespace: map[string]int64{},
 		ByActor:     map[string]int64{},
 	}
@@ -210,7 +330,8 @@ func (s *sqliteStore) Stats(ctx context.Context, f Filter) (*Stats, error) {
 		where string
 	}
 	buckets := []bucket{
-		{"type", out.ByType, ""},
+		{"resource_kind", out.ByKind, "resource_kind IS NOT NULL AND resource_kind <> ''"},
+		{"reason", out.ByReason, "reason IS NOT NULL AND reason <> ''"},
 		{"namespace", out.ByNamespace, "namespace IS NOT NULL AND namespace <> ''"},
 		{"actor_id", out.ByActor, "actor_id IS NOT NULL AND actor_id <> ''"},
 	}
@@ -250,9 +371,15 @@ func (s *sqliteStore) Stats(ctx context.Context, f Filter) (*Stats, error) {
 	return out, nil
 }
 
+// cursorKey is the meta key of the events API cursor. It differs from the key
+// used before the events API moved to Kubernetes Events, so an upgraded
+// database starts with a relist instead of resuming from a cursor the new
+// API doesn't understand.
+const cursorKey = "events_cursor"
+
 func (s *sqliteStore) LatestCursor(ctx context.Context) (string, error) {
 	var v sql.NullString
-	err := s.db.QueryRowContext(ctx, `SELECT value FROM meta WHERE key = 'cursor'`).Scan(&v)
+	err := s.db.QueryRowContext(ctx, `SELECT value FROM meta WHERE key = ?`, cursorKey).Scan(&v)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
@@ -264,8 +391,8 @@ func (s *sqliteStore) LatestCursor(ctx context.Context) (string, error) {
 
 func (s *sqliteStore) SaveCursor(ctx context.Context, cursor string) error {
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO meta(key, value) VALUES ('cursor', ?)
-		ON CONFLICT(key) DO UPDATE SET value = excluded.value`, cursor)
+		INSERT INTO meta(key, value) VALUES (?, ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value`, cursorKey, cursor)
 	return err
 }
 
@@ -274,7 +401,8 @@ func (s *sqliteStore) Close() error { return s.db.Close() }
 // ---- helpers ----
 
 const baseSelect = `SELECT id, resource_version, type, occurred_at, namespace,
-   resource_kind, resource_name, actor_type, actor_id, envelope FROM events`
+   resource_kind, resource_name, actor_type, actor_id, envelope,
+   event_name, cluster, reason, severity, message FROM events`
 
 type scanner interface {
 	Scan(dest ...any) error
@@ -282,14 +410,17 @@ type scanner interface {
 
 func scanEvent(r scanner) (*Event, error) {
 	var (
-		e            Event
-		ns, rk, rn   sql.NullString
-		at, aid      sql.NullString
-		occurred     string
-		envelopeText string
+		e                     Event
+		ns, rk, rn            sql.NullString
+		at, aid               sql.NullString
+		name, cluster, reason sql.NullString
+		severity, message     sql.NullString
+		occurred              string
+		envelopeText          string
 	)
-	if err := r.Scan(&e.ID, &e.ResourceVersion, &e.Type, &occurred,
-		&ns, &rk, &rn, &at, &aid, &envelopeText); err != nil {
+	if err := r.Scan(&e.ID, &e.Cursor, &e.Type, &occurred,
+		&ns, &rk, &rn, &at, &aid, &envelopeText,
+		&name, &cluster, &reason, &severity, &message); err != nil {
 		return nil, err
 	}
 	t, err := time.Parse(time.RFC3339Nano, occurred)
@@ -302,6 +433,11 @@ func scanEvent(r scanner) (*Event, error) {
 	e.ResourceName = rn.String
 	e.ActorType = at.String
 	e.ActorID = aid.String
+	e.Name = name.String
+	e.Cluster = cluster.String
+	e.Reason = reason.String
+	e.Severity = severity.String
+	e.Message = message.String
 	e.Envelope = json.RawMessage(envelopeText)
 	return &e, nil
 }
@@ -311,40 +447,36 @@ func buildWhere(base string, f Filter) (string, []any) {
 		conds []string
 		args  []any
 	)
-	if len(f.Types) > 0 {
-		conds = append(conds, "type IN ("+placeholders(len(f.Types))+")")
-		for _, v := range f.Types {
+	in := func(col string, vals []string) {
+		if len(vals) == 0 {
+			return
+		}
+		conds = append(conds, col+" IN ("+placeholders(len(vals))+")")
+		for _, v := range vals {
 			args = append(args, v)
 		}
 	}
-	if len(f.Namespaces) > 0 {
-		conds = append(conds, "namespace IN ("+placeholders(len(f.Namespaces))+")")
-		for _, v := range f.Namespaces {
-			args = append(args, v)
-		}
-	}
-	if len(f.Actors) > 0 {
-		conds = append(conds, "actor_id IN ("+placeholders(len(f.Actors))+")")
-		for _, v := range f.Actors {
-			args = append(args, v)
-		}
-	}
+	in("resource_kind", f.Kinds)
+	in("reason", f.Reasons)
+	in("namespace", f.Namespaces)
+	in("actor_id", f.Actors)
 	if f.Search != "" {
-		conds = append(conds, "(resource_name LIKE ? OR envelope LIKE ?)")
+		conds = append(conds, "(resource_name LIKE ? OR message LIKE ? OR envelope LIKE ?)")
 		like := "%" + f.Search + "%"
-		args = append(args, like, like)
+		args = append(args, like, like, like)
 	}
 	if f.Since != nil {
 		conds = append(conds, "occurred_at >= ?")
-		args = append(args, f.Since.UTC().Format(time.RFC3339Nano))
+		args = append(args, formatTime(*f.Since))
 	}
 	if f.Until != nil {
 		conds = append(conds, "occurred_at <= ?")
-		args = append(args, f.Until.UTC().Format(time.RFC3339Nano))
+		args = append(args, formatTime(*f.Until))
 	}
-	if f.BeforeID > 0 {
-		conds = append(conds, "id < ?")
-		args = append(args, f.BeforeID)
+	if f.Before != nil {
+		at := formatTime(f.Before.OccurredAt)
+		conds = append(conds, "(occurred_at < ? OR (occurred_at = ? AND id < ?))")
+		args = append(args, at, at, f.Before.ID)
 	}
 	q := base
 	if len(conds) > 0 {

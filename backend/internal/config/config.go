@@ -13,25 +13,26 @@ type Config struct {
 	Port string
 
 	// EverestAPIURL is the base URL of the OpenEverest API (e.g.
-	// http://everest-server.everest-system.svc.cluster.local:8080).
+	// http://everest.everest-system.svc.cluster.local:8080).
 	EverestAPIURL string
 
-	// ServiceUser and ServicePassword are credentials for authenticating against
-	// the Everest API via POST /v1/session. Required until the host provides
-	// projected service tokens (spec 003 §10.4).
+	// ServiceUser and ServicePassword are the credentials of the OpenEverest
+	// user the daemon logs in as. The host doesn't issue plugin service tokens
+	// yet (spec 003 §10.4).
 	ServiceUser     string
 	ServicePassword string
 
 	// DBPath is the on-disk location of the SQLite database.
 	DBPath string
 
-	// EventTypes is an optional comma-separated list of event types to subscribe
-	// to. Empty means "all".
-	EventTypes string
+	// Cluster is the OpenEverest cluster whose lifecycle events are recorded.
+	Cluster string
 
-	// Namespaces optionally restricts the subscription to a comma-separated list
-	// of namespaces.
+	// Namespaces, Kinds and Reasons are optional comma-separated filters passed
+	// to the events API. Empty means all.
 	Namespaces string
+	Kinds      string
+	Reasons    string
 }
 
 func FromEnv() Config {
@@ -41,8 +42,10 @@ func FromEnv() Config {
 		ServiceUser:     os.Getenv("EVEREST_SERVICE_USER"),
 		ServicePassword: os.Getenv("EVEREST_SERVICE_PASSWORD"),
 		DBPath:          getenv("AUDIT_DB_PATH", "/data/audit.db"),
-		EventTypes:      os.Getenv("AUDIT_EVENT_TYPES"),
-		Namespaces:    os.Getenv("AUDIT_NAMESPACES"),
+		Cluster:         getenv("AUDIT_CLUSTER", "main"),
+		Namespaces:      os.Getenv("AUDIT_NAMESPACES"),
+		Kinds:           os.Getenv("AUDIT_KINDS"),
+		Reasons:         os.Getenv("AUDIT_REASONS"),
 	}
 }
 
@@ -55,7 +58,7 @@ func discoverEverestAPI() string {
 	if host != "" && port != "" {
 		return fmt.Sprintf("http://%s:%s", host, port)
 	}
-	return "http://everest-server.everest-system.svc.cluster.local:8080"
+	return "http://everest.everest-system.svc.cluster.local:8080"
 }
 
 func getenv(key, def string) string {
