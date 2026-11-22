@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -16,19 +19,25 @@ import (
 // tokenRenewMargin renews the access token this long before it expires.
 const tokenRenewMargin = time.Minute
 
-// tokenSource logs in to the OpenEverest API with POST /v1/auth/token.
+// tokenSource returns the token the daemon calls the OpenEverest API with.
 //
-// It uses the password grant once and then renews the access token with the
+// It prefers the plugin service token the host mounts at tokenFile and keeps
+// current, re-reading the file on every call so a renewed token is picked up.
+// Without one, e.g. on an OpenEverest version that doesn't issue plugin
+// tokens, it logs in as user with POST /v1/auth/token.
+//
+// The login uses the password grant once and then renews the access token with the
 // refresh token, which the server rotates on every use. Each password grant is
 // recorded as a LoginSucceeded event, so logging in again on every renewal
 // would fill the audit log with the daemon's own logins and hit the login rate
 // limit. The password grant is only repeated when the refresh fails.
 type tokenSource struct {
-	apiURL   string
-	user     string
-	password string
-	http     *http.Client
-	now      func() time.Time
+	tokenFile string
+	apiURL    string
+	user      string
+	password  string
+	http      *http.Client
+	now       func() time.Time
 
 	mu           sync.Mutex
 	accessToken  string
@@ -44,8 +53,17 @@ type tokenResponse struct {
 
 // Token returns a valid access token.
 func (s *tokenSource) Token(ctx context.Context) (string, error) {
+	if s.tokenFile != "" {
+		raw, err := os.ReadFile(s.tokenFile)
+		if token := strings.TrimSpace(string(raw)); err == nil && token != "" {
+			return token, nil
+		}
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return "", fmt.Errorf("read the service token: %w", err)
+		}
+	}
 	if s.user == "" || s.password == "" {
-		return "", fmt.Errorf("EVEREST_SERVICE_USER and EVEREST_SERVICE_PASSWORD must be set")
+		return "", fmt.Errorf("no plugin service token at %s, and EVEREST_SERVICE_USER and EVEREST_SERVICE_PASSWORD are not set", s.tokenFile)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()

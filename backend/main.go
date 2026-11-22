@@ -9,8 +9,8 @@
 //     /api/facets and /api/stats so the UI can browse the audit log.
 //  3. Bundle host — serves /main.js and /icon.png for the frontend.
 //
-// The daemon logs in to the OpenEverest API as EVEREST_SERVICE_USER with
-// POST /v1/auth/token.
+// The daemon calls the OpenEverest API with the plugin service token the host
+// mounts at EVEREST_TOKEN_PATH, or else logs in as EVEREST_SERVICE_USER.
 package main
 
 import (

@@ -78,6 +78,12 @@ helm install audit charts/audit \
 
 The Plugin CR is created automatically; the OpenEverest controller will register the route and sidebar item at `/audit`.
 
+### Authentication
+
+There are no credentials to set up. The Plugin CR declares the permissions the daemon needs (`read-events` on the recorded kinds and `read` on `platform-events`), and OpenEverest issues the plugin a service token with exactly those permissions. The token lives in the `<release>-token` Secret, is mounted at `/var/run/secrets/everest/token` and is renewed automatically.
+
+OpenEverest versions that don't issue plugin service tokens need a user to log in as instead. Create a Secret with `username` and `password` keys and set `auth.credentialsSecretName`; see [`values.yaml`](charts/audit/values.yaml) for the permissions that user needs.
+
 ---
 
 ## Configuration
@@ -92,6 +98,7 @@ Key Helm values (see [`charts/audit/values.yaml`](charts/audit/values.yaml) for 
 | `storage.persistence.size` | `5Gi` | PVC size |
 | `storage.sqlite.path` | `/data/audit.db` | Database file path inside the pod |
 | `everestAPIURL` | `""` | Override Everest API URL; auto-discovered when empty |
+| `auth.credentialsSecretName` | `""` | Secret with `username` and `password`, used only when OpenEverest issues no service token |
 | `resources` | small | CPU/memory requests & limits |
 
 Environment variables (also configurable directly on the Deployment):
@@ -104,6 +111,7 @@ Environment variables (also configurable directly on the Deployment):
 | `AUDIT_NAMESPACES` | (chart-driven) | CSV of namespaces |
 | `EVEREST_API_URL` | auto | Override Everest API URL |
 | `EVEREST_TOKEN_PATH` | `/var/run/secrets/everest/token` | Mounted plugin service token |
+| `EVEREST_SERVICE_USER`, `EVEREST_SERVICE_PASSWORD` | | Fallback login when there is no service token |
 
 ---
 

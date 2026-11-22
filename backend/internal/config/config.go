@@ -16,9 +16,13 @@ type Config struct {
 	// http://everest.everest-system.svc.cluster.local:8080).
 	EverestAPIURL string
 
-	// ServiceUser and ServicePassword are the credentials of the OpenEverest
-	// user the daemon logs in as. The host doesn't issue plugin service tokens
-	// yet (spec 003 §10.4).
+	// ServiceTokenPath is where the host mounts the plugin service token
+	// (spec 003 §10.4).
+	ServiceTokenPath string
+
+	// ServiceUser and ServicePassword are the credentials of an OpenEverest
+	// user the daemon logs in as when there is no service token, e.g. on an
+	// OpenEverest version that doesn't issue plugin tokens.
 	ServiceUser     string
 	ServicePassword string
 
@@ -37,15 +41,16 @@ type Config struct {
 
 func FromEnv() Config {
 	return Config{
-		Port:            getenv("PORT", "8080"),
-		EverestAPIURL:   discoverEverestAPI(),
-		ServiceUser:     os.Getenv("EVEREST_SERVICE_USER"),
-		ServicePassword: os.Getenv("EVEREST_SERVICE_PASSWORD"),
-		DBPath:          getenv("AUDIT_DB_PATH", "/data/audit.db"),
-		Cluster:         getenv("AUDIT_CLUSTER", "main"),
-		Namespaces:      os.Getenv("AUDIT_NAMESPACES"),
-		Kinds:           os.Getenv("AUDIT_KINDS"),
-		Reasons:         os.Getenv("AUDIT_REASONS"),
+		Port:             getenv("PORT", "8080"),
+		EverestAPIURL:    discoverEverestAPI(),
+		ServiceTokenPath: getenv("EVEREST_TOKEN_PATH", "/var/run/secrets/everest/token"),
+		ServiceUser:      os.Getenv("EVEREST_SERVICE_USER"),
+		ServicePassword:  os.Getenv("EVEREST_SERVICE_PASSWORD"),
+		DBPath:           getenv("AUDIT_DB_PATH", "/data/audit.db"),
+		Cluster:          getenv("AUDIT_CLUSTER", "main"),
+		Namespaces:       os.Getenv("AUDIT_NAMESPACES"),
+		Kinds:            os.Getenv("AUDIT_KINDS"),
+		Reasons:          os.Getenv("AUDIT_REASONS"),
 	}
 }
 
