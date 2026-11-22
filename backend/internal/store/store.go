@@ -1,7 +1,4 @@
-// Package store persists audit events.
-//
-// The MVP ships a single SQLite-backed implementation. Phase 2 will introduce
-// a PostgreSQL driver behind the same Store interface.
+// Package store persists audit events in SQLite or PostgreSQL.
 package store
 
 import (
@@ -13,8 +10,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	_ "modernc.org/sqlite"
 )
 
 // Event is the persisted form of a lifecycle event (GET
@@ -159,121 +154,71 @@ type Store interface {
 	Close() error
 }
 
-// OpenSQLite opens (and migrates) the SQLite database at path.
-func OpenSQLite(path string) (Store, error) {
-	if err := ensureDir(path); err != nil {
-		return nil, err
+// Open opens (and migrates) the store of driver: "sqlite" with the path of
+// the database file, or "postgres" with a connection URI.
+func Open(driver, dsn string) (Store, error) {
+	switch driver {
+	case "sqlite":
+		return OpenSQLite(dsn)
+	case "postgres":
+		return OpenPostgres(dsn)
+	default:
+		return nil, fmt.Errorf("unknown storage driver %q", driver)
 	}
-	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(on)", path)
-	db, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		return nil, fmt.Errorf("open sqlite: %w", err)
-	}
-	db.SetMaxOpenConns(1) // SQLite is single-writer; keep things simple.
-	s := &sqliteStore{db: db}
-	if err := s.migrate(); err != nil {
-		db.Close()
-		return nil, err
-	}
-	return s, nil
 }
 
-type sqliteStore struct {
+// dialect holds what differs between the SQL databases.
+type dialect struct {
+	// like is the case-insensitive LIKE operator.
+	like string
+	// epoch is the Unix time of occurred_at in whole seconds.
+	epoch string
+	// numbered placeholders are $1, $2, ... instead of ?.
+	numbered bool
+	// time converts a time to a query argument compared with occurred_at.
+	time func(time.Time) any
+}
+
+// sqlStore is the Store over a database/sql database. Queries are written
+// with ? placeholders, see bind.
+type sqlStore struct {
 	db *sql.DB
+	d  dialect
 }
 
-const schema = `
-CREATE TABLE IF NOT EXISTS events (
-  id               INTEGER PRIMARY KEY AUTOINCREMENT,
-  resource_version TEXT NOT NULL,
-  type             TEXT NOT NULL,
-  occurred_at      TEXT NOT NULL,
-  namespace        TEXT,
-  resource_kind    TEXT,
-  resource_name    TEXT,
-  actor_type       TEXT,
-  actor_id         TEXT,
-  envelope         TEXT NOT NULL,
-  UNIQUE(resource_version, type, resource_kind, resource_name)
-);
-CREATE INDEX IF NOT EXISTS idx_events_occurred_at ON events(occurred_at DESC);
-CREATE INDEX IF NOT EXISTS idx_events_type        ON events(type);
-CREATE INDEX IF NOT EXISTS idx_events_namespace   ON events(namespace);
-CREATE INDEX IF NOT EXISTS idx_events_actor       ON events(actor_id);
-
-CREATE TABLE IF NOT EXISTS meta (
-  key   TEXT PRIMARY KEY,
-  value TEXT NOT NULL
-);
-`
-
-// addedColumns were added when the events API moved to Kubernetes Events.
-// Rows stored before keep NULL in them.
-var addedColumns = []string{"event_name", "cluster", "reason", "severity", "message", "instance", "provider"}
-
-// A relist returns events already stored, possibly with a newer
-// resourceVersion, so events are identified by their Kubernetes name.
-const eventIndexes = `
-CREATE UNIQUE INDEX IF NOT EXISTS idx_events_identity
-  ON events(COALESCE(cluster, ''), COALESCE(namespace, ''), event_name) WHERE event_name IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_events_kind   ON events(resource_kind);
-CREATE INDEX IF NOT EXISTS idx_events_reason ON events(reason);
-CREATE INDEX IF NOT EXISTS idx_events_provider ON events(provider);
-`
-
-func (s *sqliteStore) migrate() error {
-	if _, err := s.db.Exec(schema); err != nil {
-		return err
+func (s *sqlStore) bind(q string) string {
+	if !s.d.numbered {
+		return q
 	}
-	existing := map[string]bool{}
-	rows, err := s.db.Query(`SELECT name FROM pragma_table_info('events')`)
-	if err != nil {
-		return err
-	}
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			rows.Close()
-			return err
-		}
-		existing[name] = true
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	for _, col := range addedColumns {
-		if existing[col] {
+	var b strings.Builder
+	n := 0
+	for _, r := range q {
+		if r == '?' {
+			n++
+			b.WriteString("$" + strconv.Itoa(n))
 			continue
 		}
-		if _, err := s.db.Exec(`ALTER TABLE events ADD COLUMN ` + col + ` TEXT`); err != nil {
-			return fmt.Errorf("add column %s: %w", col, err)
-		}
+		b.WriteRune(r)
 	}
-	if _, err := s.db.Exec(eventIndexes); err != nil {
-		return err
-	}
-	// Earlier versions stored RFC 3339 times with a variable number of
-	// fractional digits, which don't sort as text.
-	_, err = s.db.Exec(`UPDATE events SET occurred_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', occurred_at), occurred_at)
-		WHERE occurred_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'`)
-	if err != nil {
-		return err
-	}
-	// An Instance is its own instance, also for events recorded before the
-	// events API reported it.
-	_, err = s.db.Exec(`UPDATE events SET instance = resource_name
-		WHERE instance IS NULL AND resource_kind = 'Instance' AND event_name IS NOT NULL`)
-	return err
+	return b.String()
 }
 
-func (s *sqliteStore) Insert(ctx context.Context, e *Event) error {
-	_, err := s.db.ExecContext(ctx, `
-		INSERT OR IGNORE INTO events
+func (s *sqlStore) query(ctx context.Context, q string, args ...any) (*sql.Rows, error) {
+	return s.db.QueryContext(ctx, s.bind(q), args...)
+}
+
+func (s *sqlStore) queryRow(ctx context.Context, q string, args ...any) *sql.Row {
+	return s.db.QueryRowContext(ctx, s.bind(q), args...)
+}
+
+func (s *sqlStore) Insert(ctx context.Context, e *Event) error {
+	_, err := s.db.ExecContext(ctx, s.bind(`
+		INSERT INTO events
 		  (resource_version, type, occurred_at, namespace, resource_kind, resource_name, actor_type, actor_id, envelope,
 		   event_name, cluster, reason, severity, message, instance, provider)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		e.Cursor, e.Type, formatTime(e.OccurredAt),
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT DO NOTHING`),
+		e.Cursor, e.Type, s.d.time(e.OccurredAt),
 		nullable(e.Namespace), nullable(e.ResourceKind), nullable(e.ResourceName),
 		nullable(e.ActorType), nullable(e.ActorID), string(e.Envelope),
 		nullable(e.Name), nullable(e.Cluster), nullable(e.Reason), nullable(e.Severity), nullable(e.Message),
@@ -282,8 +227,8 @@ func (s *sqliteStore) Insert(ctx context.Context, e *Event) error {
 	return err
 }
 
-func (s *sqliteStore) Get(ctx context.Context, id int64) (*Event, error) {
-	row := s.db.QueryRowContext(ctx, baseSelect+` WHERE id = ?`, id)
+func (s *sqlStore) Get(ctx context.Context, id int64) (*Event, error) {
+	row := s.queryRow(ctx, baseSelect+` WHERE id = ?`, id)
 	e, err := scanEvent(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -291,7 +236,7 @@ func (s *sqliteStore) Get(ctx context.Context, id int64) (*Event, error) {
 	return e, err
 }
 
-func (s *sqliteStore) Query(ctx context.Context, f Filter) ([]Event, error) {
+func (s *sqlStore) Query(ctx context.Context, f Filter) ([]Event, error) {
 	var out []Event
 	err := s.Each(ctx, f, func(e *Event) error {
 		out = append(out, *e)
@@ -300,15 +245,15 @@ func (s *sqliteStore) Query(ctx context.Context, f Filter) ([]Event, error) {
 	return out, err
 }
 
-func (s *sqliteStore) Each(ctx context.Context, f Filter, fn func(*Event) error) error {
-	q, args := buildWhere(baseSelect, f)
+func (s *sqlStore) Each(ctx context.Context, f Filter, fn func(*Event) error) error {
+	q, args := s.where(baseSelect, f)
 	q += ` ORDER BY occurred_at DESC, id DESC LIMIT ?`
 	limit := f.Limit
 	if limit <= 0 {
 		limit = 100
 	}
 	args = append(args, limit)
-	rows, err := s.db.QueryContext(ctx, q, args...)
+	rows, err := s.query(ctx, q, args...)
 	if err != nil {
 		return err
 	}
@@ -325,7 +270,7 @@ func (s *sqliteStore) Each(ctx context.Context, f Filter, fn func(*Event) error)
 	return rows.Err()
 }
 
-func (s *sqliteStore) Facets(ctx context.Context, f Filter) (*Facets, error) {
+func (s *sqlStore) Facets(ctx context.Context, f Filter) (*Facets, error) {
 	out := &Facets{}
 	for _, d := range []struct {
 		col string
@@ -352,11 +297,11 @@ func (s *sqliteStore) Facets(ctx context.Context, f Filter) (*Facets, error) {
 
 // count returns the most frequent non-empty values of col, which must be a
 // constant column name, among the events matching f.
-func (s *sqliteStore) count(ctx context.Context, col string, f Filter) ([]FacetValue, error) {
+func (s *sqlStore) count(ctx context.Context, col string, f Filter) ([]FacetValue, error) {
 	f.Before = nil
-	q, args := buildWhere(`SELECT `+col+`, COUNT(*) FROM events`, f, col+` IS NOT NULL AND `+col+` <> ''`)
+	q, args := s.where(`SELECT `+col+`, COUNT(*) FROM events`, f, col+` IS NOT NULL AND `+col+` <> ''`)
 	q += fmt.Sprintf(` GROUP BY %[1]s ORDER BY COUNT(*) DESC, %[1]s LIMIT %[2]d`, col, maxFacetValues)
-	rows, err := s.db.QueryContext(ctx, q, args...)
+	rows, err := s.query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -372,23 +317,17 @@ func (s *sqliteStore) count(ctx context.Context, col string, f Filter) ([]FacetV
 	return out, rows.Err()
 }
 
-func (s *sqliteStore) Span(ctx context.Context, f Filter) (oldest, newest time.Time, ok bool, err error) {
+func (s *sqlStore) Span(ctx context.Context, f Filter) (oldest, newest time.Time, ok bool, err error) {
 	f.Before = nil
-	q, args := buildWhere(`SELECT MIN(occurred_at), MAX(occurred_at) FROM events`, f)
-	var lo, hi sql.NullString
-	if err = s.db.QueryRowContext(ctx, q, args...).Scan(&lo, &hi); err != nil || !lo.Valid || !hi.Valid {
+	q, args := s.where(`SELECT MIN(occurred_at), MAX(occurred_at) FROM events`, f)
+	var lo, hi sqlTime
+	if err = s.queryRow(ctx, q, args...).Scan(&lo, &hi); err != nil || !lo.Valid || !hi.Valid {
 		return oldest, newest, false, err
 	}
-	if oldest, err = time.Parse(time.RFC3339Nano, lo.String); err != nil {
-		return oldest, newest, false, err
-	}
-	if newest, err = time.Parse(time.RFC3339Nano, hi.String); err != nil {
-		return oldest, newest, false, err
-	}
-	return oldest, newest, true, nil
+	return lo.Time, hi.Time, true, nil
 }
 
-func (s *sqliteStore) Histogram(ctx context.Context, f Filter, start time.Time, step time.Duration) ([]Bucket, error) {
+func (s *sqlStore) Histogram(ctx context.Context, f Filter, start time.Time, step time.Duration) ([]Bucket, error) {
 	secs := int64(step / time.Second)
 	if secs <= 0 {
 		return nil, errors.New("histogram step must be at least a second")
@@ -397,13 +336,13 @@ func (s *sqliteStore) Histogram(ctx context.Context, f Filter, start time.Time, 
 	from := start.Unix()
 	// The bucket of an event is its offset from start in steps; occurred_at
 	// is at or after start, so the integer division rounds down.
-	base := `SELECT (CAST(strftime('%s', occurred_at) AS INTEGER) - ?) / ? AS bucket,
-		SUM(COALESCE(severity, '') = 'Warning'), COUNT(*) FROM events`
-	q, args := buildWhere(base, f, "occurred_at >= ?")
+	base := `SELECT (` + s.d.epoch + ` - ?) / ? AS bucket,
+		SUM(CASE WHEN severity = 'Warning' THEN 1 ELSE 0 END), COUNT(*) FROM events`
+	q, args := s.where(base, f, "occurred_at >= ?")
 	args = append([]any{from, secs}, args...)
-	args = append(args, formatTime(start))
+	args = append(args, s.d.time(start))
 	q += ` GROUP BY bucket ORDER BY bucket`
-	rows, err := s.db.QueryContext(ctx, q, args...)
+	rows, err := s.query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -423,7 +362,7 @@ func (s *sqliteStore) Histogram(ctx context.Context, f Filter, start time.Time, 
 	return out, rows.Err()
 }
 
-func (s *sqliteStore) Stats(ctx context.Context, f Filter) (*Stats, error) {
+func (s *sqlStore) Stats(ctx context.Context, f Filter) (*Stats, error) {
 	out := &Stats{
 		ByKind:      map[string]int64{},
 		ByReason:    map[string]int64{},
@@ -431,8 +370,8 @@ func (s *sqliteStore) Stats(ctx context.Context, f Filter) (*Stats, error) {
 		ByActor:     map[string]int64{},
 	}
 
-	if q, args := buildWhere(`SELECT COUNT(*) FROM events`, f); true {
-		if err := s.db.QueryRowContext(ctx, q, args...).Scan(&out.Total); err != nil {
+	if q, args := s.where(`SELECT COUNT(*) FROM events`, f); true {
+		if err := s.queryRow(ctx, q, args...).Scan(&out.Total); err != nil {
 			return nil, err
 		}
 	}
@@ -450,9 +389,9 @@ func (s *sqliteStore) Stats(ctx context.Context, f Filter) (*Stats, error) {
 	}
 	for _, b := range buckets {
 		base := fmt.Sprintf(`SELECT %s, COUNT(*) FROM events`, b.col)
-		q, args := buildWhere(base, f, b.where)
+		q, args := s.where(base, f, b.where)
 		q += fmt.Sprintf(" GROUP BY %s ORDER BY COUNT(*) DESC LIMIT 25", b.col)
-		rows, err := s.db.QueryContext(ctx, q, args...)
+		rows, err := s.query(ctx, q, args...)
 		if err != nil {
 			return nil, err
 		}
@@ -468,11 +407,9 @@ func (s *sqliteStore) Stats(ctx context.Context, f Filter) (*Stats, error) {
 		rows.Close()
 	}
 
-	var lastStr sql.NullString
-	if err := s.db.QueryRowContext(ctx, `SELECT MAX(occurred_at) FROM events`).Scan(&lastStr); err == nil && lastStr.Valid {
-		if t, perr := time.Parse(time.RFC3339Nano, lastStr.String); perr == nil {
-			out.LastEventAt = &t
-		}
+	var last sqlTime
+	if err := s.queryRow(ctx, `SELECT MAX(occurred_at) FROM events`).Scan(&last); err == nil && last.Valid {
+		out.LastEventAt = &last.Time
 	}
 	return out, nil
 }
@@ -483,9 +420,9 @@ func (s *sqliteStore) Stats(ctx context.Context, f Filter) (*Stats, error) {
 // API doesn't understand.
 const cursorKey = "events_cursor"
 
-func (s *sqliteStore) LatestCursor(ctx context.Context) (string, error) {
+func (s *sqlStore) LatestCursor(ctx context.Context) (string, error) {
 	var v sql.NullString
-	err := s.db.QueryRowContext(ctx, `SELECT value FROM meta WHERE key = ?`, cursorKey).Scan(&v)
+	err := s.queryRow(ctx, `SELECT value FROM meta WHERE key = ?`, cursorKey).Scan(&v)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
@@ -495,14 +432,14 @@ func (s *sqliteStore) LatestCursor(ctx context.Context) (string, error) {
 	return v.String, nil
 }
 
-func (s *sqliteStore) SaveCursor(ctx context.Context, cursor string) error {
-	_, err := s.db.ExecContext(ctx, `
+func (s *sqlStore) SaveCursor(ctx context.Context, cursor string) error {
+	_, err := s.db.ExecContext(ctx, s.bind(`
 		INSERT INTO meta(key, value) VALUES (?, ?)
-		ON CONFLICT(key) DO UPDATE SET value = excluded.value`, cursorKey, cursor)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value`), cursorKey, cursor)
 	return err
 }
 
-func (s *sqliteStore) Close() error { return s.db.Close() }
+func (s *sqlStore) Close() error { return s.db.Close() }
 
 // ---- helpers ----
 
@@ -522,7 +459,7 @@ func scanEvent(r scanner) (*Event, error) {
 		name, cluster, reason sql.NullString
 		severity, message     sql.NullString
 		instance, provider    sql.NullString
-		occurred              string
+		occurred              sqlTime
 		envelopeText          string
 	)
 	if err := r.Scan(&e.ID, &e.Cursor, &e.Type, &occurred,
@@ -530,11 +467,7 @@ func scanEvent(r scanner) (*Event, error) {
 		&name, &cluster, &reason, &severity, &message, &instance, &provider); err != nil {
 		return nil, err
 	}
-	t, err := time.Parse(time.RFC3339Nano, occurred)
-	if err != nil {
-		return nil, fmt.Errorf("parse occurred_at: %w", err)
-	}
-	e.OccurredAt = t
+	e.OccurredAt = occurred.Time
 	e.Namespace = ns.String
 	e.ResourceKind = rk.String
 	e.ResourceName = rn.String
@@ -551,9 +484,9 @@ func scanEvent(r scanner) (*Event, error) {
 	return &e, nil
 }
 
-// buildWhere appends the conditions of f, and extra conditions that take no
+// where appends the conditions of f, and extra conditions that take no
 // arguments, to base.
-func buildWhere(base string, f Filter, extra ...string) (string, []any) {
+func (s *sqlStore) where(base string, f Filter, extra ...string) (string, []any) {
 	var (
 		conds []string
 		args  []any
@@ -573,26 +506,30 @@ func buildWhere(base string, f Filter, extra ...string) (string, []any) {
 	in("actor_id", f.Actors)
 	in("provider", f.Providers)
 	in("COALESCE(severity, 'Normal')", f.Severities)
-	if f.Name != "" {
-		conds = append(conds, `(resource_name LIKE ? ESCAPE '\' OR instance LIKE ? ESCAPE '\')`)
-		like := "%" + escapeLike(f.Name) + "%"
-		args = append(args, like, like)
+	// contains matches the events where any of cols contains text.
+	contains := func(text string, cols ...string) {
+		if text == "" {
+			return
+		}
+		var or []string
+		for _, col := range cols {
+			or = append(or, col+" "+s.d.like+` ? ESCAPE '\'`)
+			args = append(args, "%"+escapeLike(text)+"%")
+		}
+		conds = append(conds, "("+strings.Join(or, " OR ")+")")
 	}
-	if f.Search != "" {
-		conds = append(conds, `(resource_name LIKE ? ESCAPE '\' OR message LIKE ? ESCAPE '\' OR envelope LIKE ? ESCAPE '\')`)
-		like := "%" + escapeLike(f.Search) + "%"
-		args = append(args, like, like, like)
-	}
+	contains(f.Name, "resource_name", "instance")
+	contains(f.Search, "resource_name", "message", "envelope")
 	if f.Since != nil {
 		conds = append(conds, "occurred_at >= ?")
-		args = append(args, formatTime(*f.Since))
+		args = append(args, s.d.time(*f.Since))
 	}
 	if f.Until != nil {
 		conds = append(conds, "occurred_at <= ?")
-		args = append(args, formatTime(*f.Until))
+		args = append(args, s.d.time(*f.Until))
 	}
 	if f.Before != nil {
-		at := formatTime(f.Before.OccurredAt)
+		at := s.d.time(f.Before.OccurredAt)
 		conds = append(conds, "(occurred_at < ? OR (occurred_at = ? AND id < ?))")
 		args = append(args, at, at, f.Before.ID)
 	}
@@ -606,6 +543,30 @@ func buildWhere(base string, f Filter, extra ...string) (string, []any) {
 		q += " WHERE " + strings.Join(conds, " AND ")
 	}
 	return q, args
+}
+
+// sqlTime scans occurred_at, which SQLite stores as text and PostgreSQL as
+// a timestamp. Valid is false for NULL.
+type sqlTime struct {
+	Time  time.Time
+	Valid bool
+}
+
+func (t *sqlTime) Scan(v any) error {
+	switch v := v.(type) {
+	case nil:
+		*t = sqlTime{}
+		return nil
+	case time.Time:
+		*t = sqlTime{v.UTC(), true}
+		return nil
+	case string:
+		p, err := time.Parse(time.RFC3339Nano, v)
+		*t = sqlTime{p, err == nil}
+		return err
+	default:
+		return fmt.Errorf("unexpected time %T", v)
+	}
 }
 
 var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)

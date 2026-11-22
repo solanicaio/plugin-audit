@@ -3,6 +3,9 @@ package store
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"net/url"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -10,6 +13,51 @@ import (
 	"testing"
 	"time"
 )
+
+// eachStore runs fn with an empty SQLite store and, when
+// AUDIT_TEST_POSTGRES_URI is set, an empty PostgreSQL store.
+func eachStore(t *testing.T, fn func(t *testing.T, st Store)) {
+	t.Run("sqlite", func(t *testing.T) {
+		fn(t, openStore(t, "sqlite", filepath.Join(t.TempDir(), "audit.db")))
+	})
+	t.Run("postgres", func(t *testing.T) {
+		uri := os.Getenv("AUDIT_TEST_POSTGRES_URI")
+		if uri == "" {
+			t.Skip("AUDIT_TEST_POSTGRES_URI is not set")
+		}
+		// Each test gets its own schema.
+		db, err := sql.Open("pgx", uri)
+		if err != nil {
+			t.Fatal(err)
+		}
+		schema := fmt.Sprintf("test_%d", time.Now().UnixNano())
+		if _, err := db.Exec(`CREATE SCHEMA ` + schema); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			db.Exec(`DROP SCHEMA ` + schema + ` CASCADE`)
+			db.Close()
+		})
+		u, err := url.Parse(uri)
+		if err != nil {
+			t.Fatal(err)
+		}
+		q := u.Query()
+		q.Set("search_path", schema)
+		u.RawQuery = q.Encode()
+		fn(t, openStore(t, "postgres", u.String()))
+	})
+}
+
+func openStore(t *testing.T, driver, dsn string) Store {
+	t.Helper()
+	st, err := Open(driver, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	return st
+}
 
 func newEvent(name, cursor, kind, reason string) *Event {
 	return &Event{
@@ -28,179 +76,168 @@ func newEvent(name, cursor, kind, reason string) *Event {
 
 func TestInsertDeduplicatesByEventName(t *testing.T) {
 	ctx := context.Background()
-	st, err := OpenSQLite(filepath.Join(t.TempDir(), "audit.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
+	eachStore(t, func(t *testing.T, st Store) {
 
-	// A relist returns the same Kubernetes Event, possibly with a newer
-	// resourceVersion.
-	for _, e := range []*Event{
-		newEvent("db1.abc", "100", "Instance", "Created"),
-		newEvent("db1.abc", "105", "Instance", "Created"),
-		newEvent("db1.def", "110", "Instance", "Created"),
-	} {
-		if err := st.Insert(ctx, e); err != nil {
+		// A relist returns the same Kubernetes Event, possibly with a newer
+		// resourceVersion.
+		for _, e := range []*Event{
+			newEvent("db1.abc", "100", "Instance", "Created"),
+			newEvent("db1.abc", "105", "Instance", "Created"),
+			newEvent("db1.def", "110", "Instance", "Created"),
+		} {
+			if err := st.Insert(ctx, e); err != nil {
+				t.Fatal(err)
+			}
+		}
+		got, err := st.Query(ctx, Filter{Limit: 10})
+		if err != nil {
 			t.Fatal(err)
 		}
-	}
-	got, err := st.Query(ctx, Filter{Limit: 10})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 2 {
-		t.Fatalf("got %d events, want 2", len(got))
-	}
+		if len(got) != 2 {
+			t.Fatalf("got %d events, want 2", len(got))
+		}
+	})
 }
 
 func TestQueryFiltersAndFacets(t *testing.T) {
 	ctx := context.Background()
-	st, err := OpenSQLite(filepath.Join(t.TempDir(), "audit.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-	for _, e := range []*Event{
-		newEvent("a", "1", "Instance", "Created"),
-		newEvent("b", "2", "Backup", "Created"),
-		newEvent("c", "3", "Instance", "Deleted"),
-	} {
-		if err := st.Insert(ctx, e); err != nil {
+	eachStore(t, func(t *testing.T, st Store) {
+		for _, e := range []*Event{
+			newEvent("a", "1", "Instance", "Created"),
+			newEvent("b", "2", "Backup", "Created"),
+			newEvent("c", "3", "Instance", "Deleted"),
+		} {
+			if err := st.Insert(ctx, e); err != nil {
+				t.Fatal(err)
+			}
+		}
+		got, err := st.Query(ctx, Filter{Kinds: []string{"Instance"}, Reasons: []string{"Deleted"}, Limit: 10})
+		if err != nil {
 			t.Fatal(err)
 		}
-	}
-	got, err := st.Query(ctx, Filter{Kinds: []string{"Instance"}, Reasons: []string{"Deleted"}, Limit: 10})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 1 || got[0].Name != "c" {
-		t.Fatalf("got %+v, want only event c", got)
-	}
-	// A facet is counted without its own selection, so the other kinds stay
-	// selectable, and with the selection of the other facets.
-	f, err := st.Facets(ctx, Filter{Kinds: []string{"Instance"}, Reasons: []string{"Created"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := Facets{
-		Kinds:      []FacetValue{{"Backup", 1}, {"Instance", 1}},
-		Reasons:    []FacetValue{{"Created", 1}, {"Deleted", 1}},
-		Namespaces: []FacetValue{{"dbs", 1}},
-		Actors:     []FacetValue{},
-		Providers:  []FacetValue{},
-	}
-	if !reflect.DeepEqual(*f, want) {
-		t.Fatalf("got facets %+v, want %+v", *f, want)
-	}
+		if len(got) != 1 || got[0].Name != "c" {
+			t.Fatalf("got %+v, want only event c", got)
+		}
+		// A facet is counted without its own selection, so the other kinds stay
+		// selectable, and with the selection of the other facets.
+		f, err := st.Facets(ctx, Filter{Kinds: []string{"Instance"}, Reasons: []string{"Created"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := Facets{
+			Kinds:      []FacetValue{{"Backup", 1}, {"Instance", 1}},
+			Reasons:    []FacetValue{{"Created", 1}, {"Deleted", 1}},
+			Namespaces: []FacetValue{{"dbs", 1}},
+			Actors:     []FacetValue{},
+			Providers:  []FacetValue{},
+		}
+		if !reflect.DeepEqual(*f, want) {
+			t.Fatalf("got facets %+v, want %+v", *f, want)
+		}
+	})
 }
 
 func TestQueryByInstanceProviderAndSeverity(t *testing.T) {
 	ctx := context.Background()
-	st, err := OpenSQLite(filepath.Join(t.TempDir(), "audit.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-	for _, in := range []struct {
-		name, kind, object, instance, provider, severity string
-	}{
-		{"a", "Instance", "orders-db", "orders-db", "percona-server-mysql", "Normal"},
-		{"b", "Backup", "nightly-1", "orders-db", "percona-server-mysql", "Warning"},
-		{"c", "Instance", "users_db", "users_db", "percona-postgresql", "Normal"},
-		{"d", "User", "admin", "", "", ""},
-	} {
-		e := newEvent(in.name, in.name, in.kind, "Created")
-		e.ResourceName, e.Instance, e.Provider, e.Severity = in.object, in.instance, in.provider, in.severity
-		if err := st.Insert(ctx, e); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for _, tc := range []struct {
-		name string
-		f    Filter
-		want string
-	}{
-		{"provider", Filter{Providers: []string{"percona-server-mysql"}}, "b,a"},
-		{"name matches the instance of a backup", Filter{Name: "orders"}, "b,a"},
-		{"name matches the object", Filter{Name: "nightly"}, "b"},
-		{"name is not a pattern", Filter{Name: "%"}, ""},
-		{"name with an underscore", Filter{Name: "s_db"}, "c"},
-		{"warnings", Filter{Severities: []string{"Warning"}}, "b"},
-		{"no severity is normal", Filter{Severities: []string{"Normal"}, Kinds: []string{"User"}}, "d"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			tc.f.Limit = 10
-			got, err := st.Query(ctx, tc.f)
-			if err != nil {
+	eachStore(t, func(t *testing.T, st Store) {
+		for _, in := range []struct {
+			name, kind, object, instance, provider, severity string
+		}{
+			{"a", "Instance", "orders-db", "orders-db", "percona-server-mysql", "Normal"},
+			{"b", "Backup", "nightly-1", "orders-db", "percona-server-mysql", "Warning"},
+			{"c", "Instance", "users_db", "users_db", "percona-postgresql", "Normal"},
+			{"d", "User", "admin", "", "", ""},
+		} {
+			e := newEvent(in.name, in.name, in.kind, "Created")
+			e.ResourceName, e.Instance, e.Provider, e.Severity = in.object, in.instance, in.provider, in.severity
+			if err := st.Insert(ctx, e); err != nil {
 				t.Fatal(err)
 			}
-			var names []string
-			for _, e := range got {
-				names = append(names, e.Name)
-			}
-			if strings.Join(names, ",") != tc.want {
-				t.Fatalf("got %v, want %s", names, tc.want)
-			}
-		})
-	}
-	f, err := st.Facets(ctx, Filter{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := []FacetValue{{"percona-server-mysql", 2}, {"percona-postgresql", 1}}; !reflect.DeepEqual(f.Providers, want) {
-		t.Fatalf("got providers %+v, want %+v", f.Providers, want)
-	}
+		}
+		for _, tc := range []struct {
+			name string
+			f    Filter
+			want string
+		}{
+			{"provider", Filter{Providers: []string{"percona-server-mysql"}}, "b,a"},
+			{"name matches the instance of a backup", Filter{Name: "orders"}, "b,a"},
+			{"name matches the object", Filter{Name: "nightly"}, "b"},
+			{"name ignores case", Filter{Name: "NIGHTLY"}, "b"},
+			{"name is not a pattern", Filter{Name: "%"}, ""},
+			{"name with an underscore", Filter{Name: "s_db"}, "c"},
+			{"warnings", Filter{Severities: []string{"Warning"}}, "b"},
+			{"no severity is normal", Filter{Severities: []string{"Normal"}, Kinds: []string{"User"}}, "d"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				tc.f.Limit = 10
+				got, err := st.Query(ctx, tc.f)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var names []string
+				for _, e := range got {
+					names = append(names, e.Name)
+				}
+				if strings.Join(names, ",") != tc.want {
+					t.Fatalf("got %v, want %s", names, tc.want)
+				}
+			})
+		}
+		f, err := st.Facets(ctx, Filter{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := []FacetValue{{"percona-server-mysql", 2}, {"percona-postgresql", 1}}; !reflect.DeepEqual(f.Providers, want) {
+			t.Fatalf("got providers %+v, want %+v", f.Providers, want)
+		}
+	})
 }
 
 func TestHistogram(t *testing.T) {
 	ctx := context.Background()
-	st, err := OpenSQLite(filepath.Join(t.TempDir(), "audit.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-	start := time.Date(2026, 11, 18, 10, 0, 0, 0, time.UTC)
-	for i, in := range []struct {
-		at       time.Duration
-		severity string
-	}{
-		{0, "Normal"},
-		{4*time.Minute + 59*time.Second, "Warning"},
-		{5 * time.Minute, ""},
-		{17 * time.Minute, "Warning"},
-		// Before the range.
-		{-time.Second, "Normal"},
-	} {
-		e := newEvent(strconv.Itoa(i), strconv.Itoa(i), "Instance", "Created")
-		e.OccurredAt, e.Severity = start.Add(in.at), in.severity
-		if err := st.Insert(ctx, e); err != nil {
+	eachStore(t, func(t *testing.T, st Store) {
+		start := time.Date(2026, 11, 18, 10, 0, 0, 0, time.UTC)
+		for i, in := range []struct {
+			at       time.Duration
+			severity string
+		}{
+			{0, "Normal"},
+			{4*time.Minute + 59*time.Second, "Warning"},
+			{5 * time.Minute, ""},
+			{17 * time.Minute, "Warning"},
+			// Before the range.
+			{-time.Second, "Normal"},
+		} {
+			e := newEvent(strconv.Itoa(i), strconv.Itoa(i), "Instance", "Created")
+			e.OccurredAt, e.Severity = start.Add(in.at), in.severity
+			if err := st.Insert(ctx, e); err != nil {
+				t.Fatal(err)
+			}
+		}
+		got, err := st.Histogram(ctx, Filter{}, start, 5*time.Minute)
+		if err != nil {
 			t.Fatal(err)
 		}
-	}
-	got, err := st.Histogram(ctx, Filter{}, start, 5*time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := []Bucket{
-		{start, 1, 1},
-		{start.Add(5 * time.Minute), 1, 0},
-		{start.Add(15 * time.Minute), 0, 1},
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("got %+v, want %+v", got, want)
-	}
+		want := []Bucket{
+			{start, 1, 1},
+			{start.Add(5 * time.Minute), 1, 0},
+			{start.Add(15 * time.Minute), 0, 1},
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("got %+v, want %+v", got, want)
+		}
 
-	oldest, newest, ok, err := st.Span(ctx, Filter{Severities: []string{"Warning"}})
-	if err != nil || !ok {
-		t.Fatalf("span: %v, %v", ok, err)
-	}
-	if !oldest.Equal(start.Add(4*time.Minute+59*time.Second)) || !newest.Equal(start.Add(17*time.Minute)) {
-		t.Fatalf("got span %s..%s", oldest, newest)
-	}
-	if _, _, ok, err := st.Span(ctx, Filter{Kinds: []string{"Nope"}}); ok || err != nil {
-		t.Fatalf("span of no events: %v, %v", ok, err)
-	}
+		oldest, newest, ok, err := st.Span(ctx, Filter{Severities: []string{"Warning"}})
+		if err != nil || !ok {
+			t.Fatalf("span: %v, %v", ok, err)
+		}
+		if !oldest.Equal(start.Add(4*time.Minute+59*time.Second)) || !newest.Equal(start.Add(17*time.Minute)) {
+			t.Fatalf("got span %s..%s", oldest, newest)
+		}
+		if _, _, ok, err := st.Span(ctx, Filter{Kinds: []string{"Nope"}}); ok || err != nil {
+			t.Fatalf("span of no events: %v, %v", ok, err)
+		}
+	})
 }
 
 // TestMigratesTheOldSchema opens a database written by v0.1.x, before the
@@ -281,60 +318,58 @@ INSERT INTO meta (key, value) VALUES ('cursor', '42');`)
 // skip events that share a timestamp.
 func TestQueryOrdersByTimeAndPages(t *testing.T) {
 	ctx := context.Background()
-	st, err := OpenSQLite(filepath.Join(t.TempDir(), "audit.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-	base := time.Date(2026, 11, 18, 10, 0, 0, 0, time.UTC)
-	for _, in := range []struct {
-		name string
-		at   time.Duration
-	}{
-		{"t3", 3 * time.Second},
-		// 1.5s and 2s compare in the wrong order as RFC 3339 text.
-		{"t1.5", 1500 * time.Millisecond},
-		{"t2a", 2 * time.Second},
-		{"t2b", 2 * time.Second},
-		{"t1", time.Second},
-	} {
-		e := newEvent(in.name, in.name, "Instance", "Created")
-		e.OccurredAt = base.Add(in.at)
-		if err := st.Insert(ctx, e); err != nil {
-			t.Fatal(err)
+	eachStore(t, func(t *testing.T, st Store) {
+		base := time.Date(2026, 11, 18, 10, 0, 0, 0, time.UTC)
+		for _, in := range []struct {
+			name string
+			at   time.Duration
+		}{
+			{"t3", 3 * time.Second},
+			// 1.5s and 2s compare in the wrong order as RFC 3339 text.
+			{"t1.5", 1500 * time.Millisecond},
+			// Times are stored to the millisecond, like page tokens.
+			{"t2a", 2*time.Second + 400*time.Microsecond},
+			{"t2b", 2*time.Second + 400*time.Microsecond},
+			{"t1", time.Second},
+		} {
+			e := newEvent(in.name, in.name, "Instance", "Created")
+			e.OccurredAt = base.Add(in.at)
+			if err := st.Insert(ctx, e); err != nil {
+				t.Fatal(err)
+			}
 		}
-	}
 
-	var names []string
-	f := Filter{Limit: 2}
-	for page := 0; page < 5; page++ {
-		got, err := st.Query(ctx, f)
+		var names []string
+		f := Filter{Limit: 2}
+		for page := 0; page < 5; page++ {
+			got, err := st.Query(ctx, f)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, e := range got {
+				names = append(names, e.Name)
+			}
+			if len(got) < f.Limit {
+				break
+			}
+			if f.Before, err = ParsePageToken(PageToken(got[len(got)-1])); err != nil {
+				t.Fatal(err)
+			}
+		}
+		want := []string{"t3", "t2b", "t2a", "t1.5", "t1"}
+		if strings.Join(names, ",") != strings.Join(want, ",") {
+			t.Fatalf("got %v, want %v", names, want)
+		}
+
+		since := base.Add(1800 * time.Millisecond)
+		got, err := st.Query(ctx, Filter{Since: &since, Limit: 10})
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, e := range got {
-			names = append(names, e.Name)
+		if len(got) != 3 {
+			t.Fatalf("got %d events since 1.8s, want 3", len(got))
 		}
-		if len(got) < f.Limit {
-			break
-		}
-		if f.Before, err = ParsePageToken(PageToken(got[len(got)-1])); err != nil {
-			t.Fatal(err)
-		}
-	}
-	want := []string{"t3", "t2b", "t2a", "t1.5", "t1"}
-	if strings.Join(names, ",") != strings.Join(want, ",") {
-		t.Fatalf("got %v, want %v", names, want)
-	}
-
-	since := base.Add(1800 * time.Millisecond)
-	got, err := st.Query(ctx, Filter{Since: &since, Limit: 10})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 3 {
-		t.Fatalf("got %d events since 1.8s, want 3", len(got))
-	}
+	})
 }
 
 // TestBackfillsInstances checks that Instance events stored before the
@@ -368,4 +403,42 @@ func TestBackfillsInstances(t *testing.T) {
 	if len(got) != 2 || got[1].Instance != "db1" || got[0].Instance != "" {
 		t.Fatalf("got %+v, want db1 as the instance of the Instance event only", got)
 	}
+}
+
+func TestCursorGetAndStats(t *testing.T) {
+	ctx := context.Background()
+	eachStore(t, func(t *testing.T, st Store) {
+		for _, c := range []string{"100", "200"} {
+			if err := st.SaveCursor(ctx, c); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if c, err := st.LatestCursor(ctx); err != nil || c != "200" {
+			t.Fatalf("got cursor %q, %v, want 200", c, err)
+		}
+
+		e := newEvent("a", "1", "Instance", "Created")
+		if err := st.Insert(ctx, e); err != nil {
+			t.Fatal(err)
+		}
+		got, err := st.Query(ctx, Filter{Limit: 1})
+		if err != nil || len(got) != 1 {
+			t.Fatalf("query: %v, %v", got, err)
+		}
+		one, err := st.Get(ctx, got[0].ID)
+		if err != nil || one == nil || one.Name != "a" || !one.OccurredAt.Equal(e.OccurredAt) || string(one.Envelope) != string(e.Envelope) {
+			t.Fatalf("got %+v, %v, want event a", one, err)
+		}
+		if one, err := st.Get(ctx, got[0].ID+1); one != nil || err != nil {
+			t.Fatalf("got %+v, %v, want no event", one, err)
+		}
+
+		stats, err := st.Stats(ctx, Filter{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stats.Total != 1 || stats.ByKind["Instance"] != 1 || stats.LastEventAt == nil || !stats.LastEventAt.Equal(e.OccurredAt) {
+			t.Fatalf("got stats %+v", stats)
+		}
+	})
 }

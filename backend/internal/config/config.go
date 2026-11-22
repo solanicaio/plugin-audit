@@ -22,8 +22,14 @@ type Config struct {
 	ServiceUser     string
 	ServicePassword string
 
+	// DBDriver is the storage driver: sqlite or postgres.
+	DBDriver string
+
 	// DBPath is the on-disk location of the SQLite database.
 	DBPath string
+
+	// DBURI is the connection URI of the PostgreSQL database.
+	DBURI string
 
 	// Cluster is the OpenEverest cluster whose lifecycle events are recorded.
 	Cluster string
@@ -41,7 +47,9 @@ func FromEnv() Config {
 		EverestAPIURL:   discoverEverestAPI(),
 		ServiceUser:     os.Getenv("EVEREST_SERVICE_USER"),
 		ServicePassword: os.Getenv("EVEREST_SERVICE_PASSWORD"),
+		DBDriver:        getenv("AUDIT_DB_DRIVER", "sqlite"),
 		DBPath:          getenv("AUDIT_DB_PATH", "/data/audit.db"),
+		DBURI:           os.Getenv("AUDIT_DB_URI"),
 		Cluster:         getenv("AUDIT_CLUSTER", "main"),
 		Namespaces:      os.Getenv("AUDIT_NAMESPACES"),
 		Kinds:           os.Getenv("AUDIT_KINDS"),

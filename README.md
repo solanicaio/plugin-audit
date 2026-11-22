@@ -10,12 +10,12 @@ Built for compliance and operational forensics: who did what, when, to which res
 
 | Area | Phase 1 (this release) | Phase 2 | Phase 3 | Phase 4 |
 | --- | --- | --- | --- | --- |
-| Storage | Embedded SQLite (PVC) | External PostgreSQL | Retention / vacuum policy | — |
+| Storage | Embedded SQLite (PVC) or external PostgreSQL | — | Retention / vacuum policy | — |
 | UI | Filter, search, JSON drawer | Saved views | MUI + theming | — |
 | Operability | `/healthz`, single replica | — | Prom metrics, structured logs | — |
 | Delivery | — | — | — | Webhook / Slack / S3 export |
 
-The MVP is **deployable end-to-end**: a Helm chart installs the Plugin CR, the backend daemon consumes SSE events from the host and stores them in SQLite, and the React extension renders the audit log at `/audit` in the OpenEverest UI.
+The MVP is **deployable end-to-end**: a Helm chart installs the Plugin CR, the backend daemon consumes SSE events from the host and stores them in SQLite or PostgreSQL, and the React extension renders the audit log at `/audit` in the OpenEverest UI.
 
 The audit log page shows the number of events over time, stacked by severity, above the event list. The time range is a preset (15 minutes to 30 days, or all) or a custom range; clicking a bar zooms into it. Events can be filtered by engine, kind, event reason, namespace, actor, severity, a database or object name, and free text. Each filter shows how many events have each value. The filters are kept in the page URL, so a view can be shared, and the matching events can be exported as CSV or JSON. The engine and the instance of backups and restores need an OpenEverest version whose events report them.
 
@@ -32,7 +32,7 @@ The audit log page shows the number of events over time, stacked by severity, ab
         │  /api/* (proxied, JWT injected)    │ └─────────┬───────────────┘ │
         │                                    │           ▼                 │
 ┌──────────────────┐                         │ ┌─────────────────────────┐ │
-│ React extension  │ ──────────────────────▶ │ │ SQLite (PVC: /data)     │ │
+│ React extension  │ ──────────────────────▶ │ │ SQLite / PostgreSQL     │ │
 │  /audit          │                         │ └─────────┬───────────────┘ │
 └──────────────────┘                         │           ▲                 │
                                              │ ┌─────────┴───────────────┐ │
@@ -78,6 +78,22 @@ helm install audit charts/audit \
 
 The Plugin CR is created automatically; the OpenEverest controller will register the route and sidebar item at `/audit`.
 
+### Store events in PostgreSQL
+
+By default events are stored in SQLite on a PVC. To keep them in an existing PostgreSQL database instead, put its connection URI in a Secret and point the chart at it:
+
+```bash
+kubectl -n everest-system create secret generic audit-db \
+  --from-literal=uri='postgres://audit:<password>@pg.example:5432/audit?sslmode=require'
+
+helm install audit oci://ghcr.io/openeverest/charts/audit \
+  --namespace everest-system \
+  --set storage.driver=postgres \
+  --set storage.postgres.uriSecretName=audit-db
+```
+
+The tables are created on startup, so the database user needs to be able to create tables in it. No PVC is created.
+
 ---
 
 ## Configuration
@@ -88,6 +104,8 @@ Key Helm values (see [`charts/audit/values.yaml`](charts/audit/values.yaml) for 
 | --- | --- | --- |
 | `plugin.eventTypes` | curated audit list | Event types to subscribe to; empty list = all |
 | `plugin.namespaces` | `[]` | Optional namespace filter |
+| `storage.driver` | `sqlite` | `sqlite` or `postgres` |
+| `storage.postgres.uriSecretName` | `""` | Secret with the PostgreSQL connection URI under the key `uri` |
 | `storage.persistence.enabled` | `true` | Provision a PVC for SQLite |
 | `storage.persistence.size` | `5Gi` | PVC size |
 | `storage.sqlite.path` | `/data/audit.db` | Database file path inside the pod |
@@ -99,7 +117,9 @@ Environment variables (also configurable directly on the Deployment):
 | Var | Default | Purpose |
 | --- | --- | --- |
 | `PORT` | `8080` | HTTP listen port |
+| `AUDIT_DB_DRIVER` | `sqlite` | `sqlite` or `postgres` |
 | `AUDIT_DB_PATH` | `/data/audit.db` | SQLite path |
+| `AUDIT_DB_URI` | — | PostgreSQL connection URI |
 | `AUDIT_EVENT_TYPES` | (chart-driven) | CSV of event types |
 | `AUDIT_NAMESPACES` | (chart-driven) | CSV of namespaces |
 | `EVEREST_API_URL` | auto | Override Everest API URL |
@@ -144,7 +164,7 @@ Point the running server at a real Everest API with `EVEREST_API_URL` and provid
 
 ## Roadmap
 
-- **Phase 2** — pluggable storage with PostgreSQL backend, retention policy, schema migration tool.
+- **Phase 2** — retention policy, schema migration tool.
 - **Phase 3** — structured logs, Prometheus metrics, saved filter views.
 - **Phase 4** — outbound delivery (webhook, Slack, S3) and alerting rules.
 
