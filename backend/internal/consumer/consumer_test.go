@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -246,5 +247,38 @@ func TestRecordsInstanceAndProvider(t *testing.T) {
 	want := map[string][2]string{"b1": {"db1", "percona-server-mysql"}, "i1": {"db1", ""}}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+func TestTokenSourcePrefersTheServiceToken(t *testing.T) {
+	logins := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		logins++
+		_, _ = io.WriteString(w, `{"access_token":"user-token","expires_in":900,"refresh_token":"rt1"}`)
+	}))
+	defer srv.Close()
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	ts := &tokenSource{tokenFile: tokenFile, apiURL: srv.URL, user: "audit", password: "secret", http: srv.Client(), now: time.Now}
+	ctx := context.Background()
+
+	// No service token yet: log in with the password.
+	if got, err := ts.Token(ctx); err != nil || got != "user-token" {
+		t.Fatalf("Token() = %q, %v; want user-token", got, err)
+	}
+	for _, want := range []string{"service-token-1", "service-token-2"} {
+		if err := os.WriteFile(tokenFile, []byte(want+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := ts.Token(ctx); err != nil || got != want {
+			t.Fatalf("Token() = %q, %v; want %s", got, err, want)
+		}
+	}
+	if logins != 1 {
+		t.Errorf("logged in %d times, want 1", logins)
+	}
+
+	noFallback := &tokenSource{tokenFile: filepath.Join(t.TempDir(), "token")}
+	if _, err := noFallback.Token(ctx); err == nil {
+		t.Error("Token() without a service token or credentials succeeded")
 	}
 }

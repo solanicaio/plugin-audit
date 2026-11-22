@@ -13,16 +13,15 @@ fullnameOverride: ""
 service:
   port: 8080
 
-# Credentials of the OpenEverest user the daemon reads the events as. The host
-# doesn't issue plugin service tokens yet (spec 003 §10.4), so the daemon logs
-# in with POST /v1/auth/token: once with the password, then with the refresh
-# token. Create a Secret with keys "username" and "password", then reference its
-# name here.
+# OpenEverest issues the plugin a service token with the permissions the
+# Plugin CR declares (spec 003 §10.4): read-events on the objects whose events
+# are recorded, and read on platform-events for logins and logouts. The token
+# is mounted from the <release>-token Secret, so there is nothing to configure.
 #
-# The events API only returns the events the user may read: read-events on the
-# objects they are about, and read on platform-events for logins and logouts.
-# The admin role covers both. A dedicated read-only role, in the everest-rbac
-# ConfigMap:
+# On an OpenEverest version that doesn't issue plugin tokens, the daemon logs in
+# as a user instead: create a Secret with keys "username" and "password" and
+# reference its name here. The user needs the same permissions, e.g. in the
+# everest-rbac ConfigMap:
 #
 #   p, role:auditor, instances, read-events, */*/*
 #   p, role:auditor, backups, read-events, */*/*

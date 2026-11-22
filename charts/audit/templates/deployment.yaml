@@ -68,6 +68,9 @@ spec:
           volumeMounts:
             - name: data
               mountPath: {{ dir .Values.storage.sqlite.path | quote }}
+            - name: service-token
+              mountPath: /var/run/secrets/everest
+              readOnly: true
           livenessProbe:
             httpGet:
               path: /healthz
@@ -83,6 +86,13 @@ spec:
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:
+        # The service token OpenEverest issues to the plugin and keeps current
+        # in the <plugin>-token Secret. Optional: older OpenEverest versions
+        # don't issue one, and the daemon then logs in with auth credentials.
+        - name: service-token
+          secret:
+            secretName: {{ .Release.Name }}-token
+            optional: true
         - name: data
           {{- if .Values.storage.persistence.enabled }}
           persistentVolumeClaim:

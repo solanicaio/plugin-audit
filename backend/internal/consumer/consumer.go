@@ -51,11 +51,12 @@ func New(cfg config.Config, st store.Store) *Consumer {
 		store: st,
 		http:  client,
 		tokens: &tokenSource{
-			apiURL:   cfg.EverestAPIURL,
-			user:     cfg.ServiceUser,
-			password: cfg.ServicePassword,
-			http:     &http.Client{Timeout: 30 * time.Second},
-			now:      time.Now,
+			tokenFile: cfg.ServiceTokenPath,
+			apiURL:    cfg.EverestAPIURL,
+			user:      cfg.ServiceUser,
+			password:  cfg.ServicePassword,
+			http:      &http.Client{Timeout: 30 * time.Second},
+			now:       time.Now,
 		},
 		idleTimeout: defaultIdleTimeout,
 	}
