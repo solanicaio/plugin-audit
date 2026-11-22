@@ -4,7 +4,7 @@
 //
 //  1. Event consumer — lists and then watches the lifecycle events of a
 //     cluster (GET /v1/clusters/{cluster}/events) and persists them into
-//     local SQLite.
+//     SQLite or PostgreSQL.
 //  2. Request handler — serves POST /api/events/query, /api/events/get,
 //     /api/facets and /api/stats so the UI can browse the audit log.
 //  3. Bundle host — serves /main.js and /icon.png for the frontend.
@@ -38,7 +38,12 @@ var iconData []byte
 func main() {
 	cfg := config.FromEnv()
 
-	st, err := store.OpenSQLite(cfg.DBPath)
+	dsn, dbInfo := cfg.DBPath, cfg.DBDriver+" "+cfg.DBPath
+	if cfg.DBDriver == "postgres" {
+		// The URI holds the password, so it isn't logged.
+		dsn, dbInfo = cfg.DBURI, cfg.DBDriver
+	}
+	st, err := store.Open(cfg.DBDriver, dsn)
 	if err != nil {
 		log.Fatalf("open store: %v", err)
 	}
@@ -62,7 +67,7 @@ func main() {
 
 	go func() {
 		log.Printf("plugin-audit listening on :%s (everest API: %s, db: %s)",
-			cfg.Port, cfg.EverestAPIURL, cfg.DBPath)
+			cfg.Port, cfg.EverestAPIURL, dbInfo)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("server error: %v", err)
 		}

@@ -69,13 +69,19 @@ plugin:
   # namespace the user may read.
   namespaces: []
 
-# Storage configuration. MVP only supports the embedded SQLite driver; Phase 2
-# will add a PostgreSQL backend selectable via storage.driver.
+# Where the audit events are stored: sqlite (a file on a PVC) or postgres (an
+# existing PostgreSQL database). The tables are created on startup, so the
+# database user needs to be able to create tables.
 storage:
   driver: sqlite
   sqlite:
     # Mount path of the persistent volume holding audit.db.
     path: /data/audit.db
+  postgres:
+    # Name of a Secret holding the connection URI under the key "uri", e.g.
+    # postgres://audit:pass@pg.example:5432/audit?sslmode=require
+    uriSecretName: ""
+  # The PVC of sqlite.
   persistence:
     enabled: true
     size: 5Gi
